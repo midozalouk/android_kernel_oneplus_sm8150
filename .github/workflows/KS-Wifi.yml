@@ -17,7 +17,7 @@ on:
       output_name:
         description: 'Name of the output.zip'
         required: false
-        default: 'OP7_KSN_wifi'
+        default: 'OP7_KS_wifi'
   push:
     branches:
       - oneplus/OOS_SM8150_11.0
@@ -37,7 +37,7 @@ jobs:
       KERNEL_CMDLINE: "ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-androidkernel- CROSS_COMPILE_ARM32=arm-linux-gnueabi- LLVM=1 LLVM_IAS=1 O=out"
       KERNEL_SOURCE_URL: ${{ github.event.inputs.kernel_source_url || 'https://github.com/LineageOS/android_kernel_oneplus_sm8150' }}
       KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch || 'lineage-22.1' }}
-      OUTPUT_ZIP_NAME: ${{ github.event.inputs.output_name || 'OP7_KSN_wifi' }}
+      OUTPUT_ZIP_NAME: ${{ github.event.inputs.output_name || 'OP7_KS_wifi' }}
 
     steps:
     - name: Checkout Kernel Source
