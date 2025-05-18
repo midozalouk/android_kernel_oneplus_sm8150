@@ -51,7 +51,7 @@ jobs:
         KERNEL_BRANCH: ${{ env.KERNEL_BRANCH }}
     - name: Apply FIX_APATCH_OPENELA.patch
       run: |
-          curl -sL https://raw.githubusercontent.com/midozalouk/android_kernel_oneplus_sm8150/oneplus/OOS_SM8150_11.0/patches/FIX_APATCH_OPENELA.patch | git apply -
+          curl -sL https://raw.githubusercontent.com/midozalouk/android_kernel_oneplus_sm8150/refs/heads/main/patches%20/FIX_APATCH_OPENELA.patch | git apply -
           working-directory: ./kernel
 
     - name: Generate Default Config
