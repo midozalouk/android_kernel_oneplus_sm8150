@@ -49,20 +49,20 @@ jobs:
       env:
         KERNEL_SOURCE_URL: ${{ env.KERNEL_SOURCE_URL }}
         KERNEL_BRANCH: ${{ env.KERNEL_BRANCH }}
-      - name: Apply FIX_APATCH_OPENELA.patch
-        run: |
+    - name: Apply FIX_APATCH_OPENELA.patch
+      run: |
           curl -sL https://raw.githubusercontent.com/midozalouk/android_kernel_oneplus_sm8150/oneplus/OOS_SM8150_11.0/patches/FIX_APATCH_OPENELA.patch | git apply -
-        working-directory: ./kernel
+          working-directory: ./kernel
 
-      - name: Generate Default Config
-        run: |
+    - name: Generate Default Config
+      run: |
           make $KERNEL_CMDLINE $KERNEL_DEFCONFIG CC="ccache clang-14"
-        working-directory: ./kernel
+          working-directory: ./kernel
 
-      - name: Update Config with Patch
-        run: |
+    - name: Update Config with Patch
+      run: |
           make $KERNEL_CMDLINE olddefconfig CC="ccache clang-14"
-        working-directory: ./kernel
+          working-directory: ./kernel
     - name: Set up ccache
       uses: hendrikmuhs/ccache-action@v1.2
       
