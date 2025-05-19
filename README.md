@@ -51,7 +51,8 @@ If Wi-Fi does **not** work after flashing:
    insmod /data/local/tmp/wlan.ko
    ```
    _You must have root access to load the module._
-
+to make it permanent just rename it to qca_cld3_wlan.ko and copy it to the modules folder 
+/Vendor/lib/modules
 ---
 
 ## 🗂️ Project Structure
