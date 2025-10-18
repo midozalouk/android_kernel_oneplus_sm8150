@@ -34,12 +34,11 @@ jobs:
       CCACHE_NOHASHDIR: "true"
       CCACHE_MAXSIZE: "2G"
       CCACHE_HARDLINK: "true"
-      # LLVM + Ubuntu cross-binutils; out-of-tree build
       KERNEL_CMDLINE: "ARCH=arm64 LLVM=1 LLVM_IAS=1 O=out CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu-"
-      KERNEL_DEFCONFIG:  ${{ github.event.inputs.kernel_defconfig || 'lineage_sm8150_defconfig' }}
-      KERNEL_SOURCE_URL: ${{ github.event.inputs.kernel_source_url || 'https://github.com/LineageOS/android_kernel_oneplus_sm8150' }}
-      KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch || 'lineage-22.1' }}
-      OUTPUT_ZIP_NAME: ${{ github.event.inputs.output_name || 'OP7_KSN_wifi' }}
+      KERNEL_DEFCONFIG: ${{ github.event.inputs.kernel_defconfig }}
+      KERNEL_SOURCE_URL: ${{ github.event.inputs.kernel_source_url }}
+      KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch }}
+      OUTPUT_ZIP_NAME: ${{ github.event.inputs.output_name }}
 
     steps:
       - name: Checkout repository
@@ -53,19 +52,16 @@ jobs:
           cd kernel
           git submodule update --init --recursive
           cd ..
-        env:
-          KERNEL_SOURCE_URL: ${{ env.KERNEL_SOURCE_URL }}
-          KERNEL_BRANCH: ${{ env.KERNEL_BRANCH }}
 
       - name: Set up ccache
         uses: hendrikmuhs/ccache-action@v1.2
 
       - name: Cleanup space
         run: |
-          sudo rm -rf /opt/ghc
-          sudo rm -rf "/usr/local/share/boost"
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf "/usr/local/share/boost" || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
 
       - name: Install dependencies (LLVM 18 + cross-binutils)
         run: |
@@ -78,13 +74,6 @@ jobs:
             ca-certificates xz-utils mkbootimg cpio device-tree-compiler git git-lfs
           git clone https://github.com/khalidaboelmagd/AnyKernel3
           rm -rf AnyKernel3/.git
-
-      - name: Remove unnecessary files
-        run: |
-          sudo rm -rf /opt/ghc
-          sudo rm -rf "/usr/local/share/boost"
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
       - name: Get Version
         id: get_version
@@ -101,91 +90,61 @@ jobs:
           export PATH=/usr/lib/llvm-18/bin:$PATH
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
 
-      # 1) Seed .config into O=out
+      # 1) Seed .config into O=out (explicit ARCH)
       - name: Prepare kernel output directory (defconfig)
         working-directory: kernel
         run: |
-          set -e
+          set -euo pipefail
           export PATH=/usr/lib/llvm-18/bin:$PATH
           export HOSTCC=clang-18
           export HOSTCXX=clang++-18
-          make O=out $KERNEL_DEFCONFIG
+          mkdir -p out
+          make O=out ARCH=arm64 ${KERNEL_DEFCONFIG}
 
-      - name: Build Kconfig tools
-        working-directory: kernel
-        run: |
-          export PATH=/usr/lib/llvm-18/bin:$PATH
-          make O=out scripts
-          
+      # 2) Non-interactive finalize: preseed QTI_GVM and accept defaults for any new symbols
       - name: Finalize kernel config (non-interactive)
         working-directory: kernel
         run: |
-          set -e
+          set -euo pipefail
           export PATH=/usr/lib/llvm-18/bin:$PATH
           cat > ../ci.defaults <<'EOF'
           CONFIG_QTI_GVM=n
           EOF
-          make O=out olddefconfig KCONFIG_ALLCONFIG=../ci.defaults
+          make O=out ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../ci.defaults
+          echo "==== Ensured config ===="
           grep -E '^CONFIG_QTI_GVM=' out/.config || true
-          
-      - name: Safety olddefconfig before build
-        working-directory: kernel
-        run: |
-            export PATH=/usr/lib/llvm-18/bin:$PATH
-            make O=out olddefconfig
-      # 2) Build scripts so scripts/config exists
-      - name: Build Kconfig tools
-        working-directory: kernel
-        run: |
-          export PATH=/usr/lib/llvm-18/bin:$PATH
-          make O=out scripts
 
-      # 3) Non-interactive finalize: preseed new options (QTI_GVM=n) and accept defaults
-      - name: Finalize kernel config (non-interactive)
-        working-directory: kernel
-        run: |
-          set -e
-          export PATH=/usr/lib/llvm-18/bin:$PATH
-          cat > ../ci.defaults <<'EOF'
-          CONFIG_QTI_GVM=n
-          CONFIG_NR_CPUS=64
-          CONFIG_HUGETLB_PAGE=n
-          CONFIG_HUGETLBFS=n
-          EOF
-          make O=out olddefconfig KCONFIG_ALLCONFIG=../ci.defaults
-          echo "==== Effective kernel config deltas ===="
-          grep -E '^CONFIG_QTI_GVM=|^CONFIG_NR_CPUS=|^CONFIG_HUGETLB' out/.config || true
-
+      # 3) Only after config is finalized, build scripts/headers
       - name: Prepare scripts and headers
         working-directory: ./kernel
         run: |
+          set -euo pipefail
           export PATH=/usr/lib/llvm-18/bin:$PATH
           export HOSTCC=clang-18
           export HOSTCXX=clang++-18
-          make $KERNEL_CMDLINE scripts CC="ccache clang-18"
-          make $KERNEL_CMDLINE prepare CC="ccache clang-18"
+          make ${KERNEL_CMDLINE} scripts CC="ccache clang-18"
+          make ${KERNEL_CMDLINE} prepare CC="ccache clang-18"
 
       - name: Build kernel
         working-directory: kernel
         env:
           KBUILD_OUTPUT: out
         run: |
-          set -e
+          set -euo pipefail
           export PATH=/usr/lib/llvm-18/bin:$PATH
           export LD_LIBRARY_PATH=/usr/lib/llvm-18/lib:$LD_LIBRARY_PATH
           export DTC_EXT=dtc
           export HOSTCC=clang-18
           export HOSTCXX=clang++-18
-          # Safety: ensure Kconfig settled
-          make O=out olddefconfig
-          make $KERNEL_CMDLINE CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j"$(nproc)"
+          make O=out ARCH=arm64 olddefconfig
+          make ${KERNEL_CMDLINE} CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j"$(nproc)"
           test -f out/arch/arm64/boot/Image
           cp out/arch/arm64/boot/Image ../AnyKernel3
 
       - name: Run simple verification on build output
         working-directory: kernel
         run: |
-          set -e
+          set -euo pipefail
           if [ -d out ]; then
             echo "Build output exists:"
             ls -lah out | sed -n '1,200p'
@@ -197,22 +156,19 @@ jobs:
       - name: Build Wi-Fi Module (qca_cld3)
         working-directory: ./kernel
         run: |
+          set -euo pipefail
           export PATH=/usr/lib/llvm-18/bin:$PATH
           export LD_LIBRARY_PATH=/usr/lib/llvm-18/lib:$LD_LIBRARY_PATH
           export HOSTCC=clang-18
           export HOSTCXX=clang++-18
-
-          make $KERNEL_CMDLINE modules_prepare CC="ccache clang-18"
-          make $KERNEL_CMDLINE CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j"$(nproc)" M=drivers/staging/qcacld-3.0 modules
-
+          make ${KERNEL_CMDLINE} modules_prepare CC="ccache clang-18"
+          make ${KERNEL_CMDLINE} CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j"$(nproc)" M=drivers/staging/qcacld-3.0 modules
           sudo mkdir -p ../modules/vendor/lib/modules
           sudo find out/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \;
           sudo chown -R "$(id -u)":"$(id -g)" ../modules
 
       - name: Package Kernel
         run: |
-          echo "Packaging kernel from: $(pwd)"
-          ls -la AnyKernel3/ || true
           cd AnyKernel3
           zip -r ../${{ env.OUTPUT_ZIP_NAME }}.zip *
           cd ..
@@ -223,8 +179,6 @@ jobs:
             echo "Error: No Wi-Fi modules found to package!"
             exit 1
           fi
-          echo "Packaging modules from: $(pwd)/modules"
-          ls -la modules/vendor/lib/modules/
           cd modules
           zip -r ../${{ env.OUTPUT_ZIP_NAME }}-modules.zip *
           cd ..
