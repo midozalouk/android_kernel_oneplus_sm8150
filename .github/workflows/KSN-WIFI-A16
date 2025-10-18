@@ -1,0 +1,168 @@
+name: Build kernel (KSN) & WIFI for Android 16
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_source_url:
+        description: 'URL of the kernel source repository'
+        required: true
+        default: 'https://github.com/LineageOS/android_kernel_oneplus_sm8150'
+      kernel_branch:
+        description: 'Branch of the kernel source'
+        required: true
+        default: 'lineage-22.1'
+      kernel_defconfig:
+        description: 'defconfig file to use'
+        required: true
+        default: 'lineage_sm8150_defconfig'
+      output_name:
+        description: 'Name of the output.zip'
+        required: false
+        default: 'OP7_KSN_wifi'
+  push:
+    branches:
+      - oneplus/OOS_SM8150_11.0
+  pull_request:
+    branches:
+      - oneplus/OOS_SM8150_11.0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_MAXSIZE: "2G"
+      CCACHE_HARDLINK: "true"
+      # Updated CROSS prefixes to match Ubuntu cross-binutils for Android 16 builds.
+      KERNEL_CMDLINE: "ARCH=arm64 LLVM=1 LLVM_IAS=1 O=out CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu-"
+      KERNEL_DEFCONFIG:  ${{ github.event.inputs.kernel_defconfig || 'lineage_sm8150_defconfig' }}
+      KERNEL_SOURCE_URL: ${{ github.event.inputs.kernel_source_url || 'https://github.com/LineageOS/android_kernel_oneplus_sm8150' }}
+      KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch || 'lineage-22.1' }}
+      OUTPUT_ZIP_NAME: ${{ github.event.inputs.output_name || 'OP7_KSN_wifi' }}
+
+    steps:
+    - name: Checkout Kernel Source
+      run: |
+        git clone --depth=1 --branch "${KERNEL_BRANCH}" "${KERNEL_SOURCE_URL}" kernel
+        cd kernel
+        git submodule update --init --recursive
+        cd ..
+      env:
+        KERNEL_SOURCE_URL: ${{ env.KERNEL_SOURCE_URL }}
+        KERNEL_BRANCH: ${{ env.KERNEL_BRANCH }}
+
+    - name: Set up ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+
+    - name: Cleanup space
+      run: |
+        sudo rm -rf /opt/ghc
+        sudo rm -rf "/usr/local/share/boost"
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+    - name: Install dependencies (LLVM 18 + cross-binutils)
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y \
+          clang-18 llvm-18 lld-18 \
+          gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+          binutils-aarch64-linux-gnu binutils \
+          make python3 libssl-dev build-essential bc bison flex unzip \
+          ca-certificates xz-utils mkbootimg cpio device-tree-compiler git git-lfs
+        # No need for Android GCC 4.9 prebuilts on Android 16; rely on LLVM and Ubuntu cross-binutils.
+
+    - name: Remove unnecessary files
+      run: |
+        sudo rm -rf /opt/ghc
+        sudo rm -rf "/usr/local/share/boost"
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+    - name: Get Version
+      id: get_version
+      run: |
+        cd kernel
+        git fetch --unshallow || true
+        COUNT=$(git rev-list --count HEAD)
+        echo "VERSION=$(expr ${COUNT:-0} + 10200)" >> $GITHUB_OUTPUT
+        cd ..
+
+    - name: KernelSU-Next setup
+      working-directory: ./kernel
+      run: |
+        export PATH=/usr/lib/llvm-18/bin:$PATH
+        curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
+
+    - name: Configure kernel
+      working-directory: ./kernel
+      run: |
+        export PATH=/usr/lib/llvm-18/bin:$PATH
+        # Ensure host tools use clang to avoid vdso/host-tool failures.
+        export HOSTCC=clang-18
+        export HOSTCXX=clang++-18
+        # Generate and finalize config.
+        make $KERNEL_CMDLINE $KERNEL_DEFCONFIG CC="ccache clang-18"
+        make $KERNEL_CMDLINE olddefconfig CC="ccache clang-18"
+        # Prepare scripts/headers.
+        make $KERNEL_CMDLINE scripts CC="ccache clang-18"
+        make $KERNEL_CMDLINE prepare CC="ccache clang-18"
+
+    - name: Build kernel
+      working-directory: ./kernel
+      run: |
+        export PATH=/usr/lib/llvm-18/bin:$PATH
+        export LD_LIBRARY_PATH=/usr/lib/llvm-18/lib:$LD_LIBRARY_PATH
+        export DTC_EXT=dtc
+        # Build kernel with full LLVM toolchain.
+        make $KERNEL_CMDLINE CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j$(nproc --all)
+        cp out/arch/arm64/boot/Image ../AnyKernel3 || { echo "Image not found"; exit 1; }
+
+    - name: Build Wi-Fi Module (qca_cld3)
+      working-directory: ./kernel
+      run: |
+        export PATH=/usr/lib/llvm-18/bin:$PATH
+        export LD_LIBRARY_PATH=/usr/lib/llvm-18/lib:$LD_LIBRARY_PATH
+        # Ensure the same toolchain/flags for modules to keep vermagic/ABI aligned.
+        make $KERNEL_CMDLINE modules_prepare CC="ccache clang-18"
+        make $KERNEL_CMDLINE CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j$(nproc --all) M=drivers/staging/qcacld-3.0 modules
+        sudo mkdir -p ../modules/vendor/lib/modules
+        sudo find out/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \;
+        sudo chown -R $(id -u):$(id -g) ../modules
+
+    - name: Package Kernel
+      run: |
+        git clone https://github.com/khalidaboelmagd/AnyKernel3
+        rm -rf AnyKernel3/.git
+        echo "Packaging kernel from: $(pwd)"
+        ls -la AnyKernel3/
+        cd AnyKernel3
+        zip -r ../${{ env.OUTPUT_ZIP_NAME }}.zip *
+        cd ..
+
+    - name: Package Wi-Fi Module
+      run: |
+        if [ ! -d "modules/vendor/lib/modules" ] || ! ls modules/vendor/lib/modules/*.ko >/dev/null 2>&1; then
+          echo "Error: No Wi-Fi modules found to package!"
+          exit 1
+        fi
+        cd modules
+        zip -r ../${{ env.OUTPUT_ZIP_NAME }}-modules.zip *
+        cd ..
+
+    - name: Upload to Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          ${{ env.OUTPUT_ZIP_NAME }}.zip
+          ${{ env.OUTPUT_ZIP_NAME }}-modules.zip
+        name: ${{ env.OUTPUT_ZIP_NAME }}-${{ steps.get_version.outputs.VERSION }}
+        tag_name: ${{ steps.get_version.outputs.VERSION }}
+        body: |
+          Device: Oneplus 7/Oneplus 7Pro/Oneplus 7T/Oneplus 7TPro
+          Includes:
+          - Kernel Image
+          - qca_cld3 Wi-Fi Module (vermagic matched)
+      env:
+        GITHUB_TOKEN: ${{ secrets.GH_PAT }}
