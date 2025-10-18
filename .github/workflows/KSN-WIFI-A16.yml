@@ -35,10 +35,10 @@ jobs:
       CCACHE_MAXSIZE: "2G"
       CCACHE_HARDLINK: "true"
       KERNEL_CMDLINE: "ARCH=arm64 LLVM=1 LLVM_IAS=1 O=out CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu-"
-      KERNEL_DEFCONFIG: ${{ github.event.inputs.kernel_defconfig }}
-      KERNEL_SOURCE_URL: ${{ github.event.inputs.kernel_source_url }}
-      KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch }}
-      OUTPUT_ZIP_NAME: ${{ github.event.inputs.output_name }}
+      KERNEL_DEFCONFIG: ${{ github.event.inputs.kernel_defconfig || 'lineage_sm8150_defconfig' }}
+      KERNEL_SOURCE_URL: ${{ github.event.inputs.kernel_source_url || 'https://github.com/LineageOS/android_kernel_oneplus_sm8150' }}
+      KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch || 'lineage-22.1' }}
+      OUTPUT_ZIP_NAME: ${{ github.event.inputs.output_name || 'OP7_KSN_wifi' }}
 
     steps:
       - name: Checkout repository
@@ -132,10 +132,11 @@ jobs:
         run: |
           set -euo pipefail
           export PATH=/usr/lib/llvm-18/bin:$PATH
-          export LD_LIBRARY_PATH=/usr/lib/llvm-18/lib:$LD_LIBRARY_PATH
+          export LD_LIBRARY_PATH="/usr/lib/llvm-18/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           export DTC_EXT=dtc
           export HOSTCC=clang-18
           export HOSTCXX=clang++-18
+          # Ensure Kconfig settled (non-interactive)
           make O=out ARCH=arm64 olddefconfig
           make ${KERNEL_CMDLINE} CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j"$(nproc)"
           test -f out/arch/arm64/boot/Image
@@ -158,13 +159,13 @@ jobs:
         run: |
           set -euo pipefail
           export PATH=/usr/lib/llvm-18/bin:$PATH
-          export LD_LIBRARY_PATH=/usr/lib/llvm-18/lib:$LD_LIBRARY_PATH
+          export LD_LIBRARY_PATH="/usr/lib/llvm-18/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           export HOSTCC=clang-18
           export HOSTCXX=clang++-18
           make ${KERNEL_CMDLINE} modules_prepare CC="ccache clang-18"
           make ${KERNEL_CMDLINE} CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j"$(nproc)" M=drivers/staging/qcacld-3.0 modules
           sudo mkdir -p ../modules/vendor/lib/modules
-          sudo find out/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \;
+          sudo find out/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ ;
           sudo chown -R "$(id -u)":"$(id -g)" ../modules
 
       - name: Package Kernel
