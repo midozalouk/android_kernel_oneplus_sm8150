@@ -53,6 +53,18 @@ jobs:
           git submodule update --init --recursive
           cd ..
 
+      - name: Apply hugetlbpage fix patch
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          # Insert missing ptep declaration after line 208 (near pte_t *pte = NULL;)
+          sed -i '208a \
+          pte_t *ptep = NULL;' arch/arm64/mm/hugetlbpage.c
+          # Replace faulty assignment at line 235 with conditional to avoid double-call or null issues
+          sed -i '235s/ptep = huge_pmd_share(mm, vma, addr, pud);/if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);/' arch/arm64/mm/hugetlbpage.c
+          echo "Patch applied:"
+          grep -A5 -B2 "ptep =" arch/arm64/mm/hugetlbpage.c | head -10
+
       - name: Set up ccache
         uses: hendrikmuhs/ccache-action@v1.2
 
@@ -101,7 +113,7 @@ jobs:
           mkdir -p out
           make O=out ARCH=arm64 ${KERNEL_DEFCONFIG}
 
-      # 2) Non-interactive finalize: preseed QTI_GVM and accept defaults for any new symbols
+      # 2) Non-interactive finalize: preseed QTI_GVM, NR_CPUS=8, and accept defaults for any new symbols
       - name: Finalize kernel config (non-interactive)
         working-directory: kernel
         run: |
@@ -109,10 +121,13 @@ jobs:
           export PATH=/usr/lib/llvm-18/bin:$PATH
           cat > ../ci.defaults <<'EOF'
           CONFIG_QTI_GVM=n
+          CONFIG_NR_CPUS=8
+          CONFIG_HUGETLB_PAGE=n
+          CONFIG_HUGETLBFS=n
           EOF
           make O=out ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../ci.defaults
           echo "==== Ensured config ===="
-          grep -E '^CONFIG_QTI_GVM=' out/.config || true
+          grep -E '^CONFIG_QTI_GVM=|^CONFIG_NR_CPUS=|^CONFIG_HUGETLB_PAGE=|^CONFIG_HUGETLBFS=' out/.config || true
 
       # 3) Only after config is finalized, build scripts/headers
       - name: Prepare scripts and headers
@@ -138,6 +153,11 @@ jobs:
           export HOSTCXX=clang++-18
           # Ensure Kconfig settled (non-interactive)
           make O=out ARCH=arm64 olddefconfig
+          # Verify critical configs before compile
+          if ! grep -q '^CONFIG_NR_CPUS=8' out/.config; then
+            echo "Error: NR_CPUS not set to 8; check config"
+            exit 1
+          fi
           make ${KERNEL_CMDLINE} CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j"$(nproc)"
           test -f out/arch/arm64/boot/Image
           cp out/arch/arm64/boot/Image ../AnyKernel3
