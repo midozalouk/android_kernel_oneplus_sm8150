@@ -111,6 +111,28 @@ jobs:
           export HOSTCXX=clang++-18
           make O=out $KERNEL_DEFCONFIG
 
+      - name: Build Kconfig tools
+        working-directory: kernel
+        run: |
+          export PATH=/usr/lib/llvm-18/bin:$PATH
+          make O=out scripts
+          
+      - name: Finalize kernel config (non-interactive)
+        working-directory: kernel
+        run: |
+          set -e
+          export PATH=/usr/lib/llvm-18/bin:$PATH
+          cat > ../ci.defaults <<'EOF'
+          CONFIG_QTI_GVM=n
+          EOF
+          make O=out olddefconfig KCONFIG_ALLCONFIG=../ci.defaults
+          grep -E '^CONFIG_QTI_GVM=' out/.config || true
+          
+      - name: Safety olddefconfig before build
+        working-directory: kernel
+        run: |
+            export PATH=/usr/lib/llvm-18/bin:$PATH
+            make O=out olddefconfig
       # 2) Build scripts so scripts/config exists
       - name: Build Kconfig tools
         working-directory: kernel
