@@ -126,6 +126,11 @@ jobs:
           CONFIG_HUGETLBFS=n
           EOF
           make O=out ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../ci.defaults
+          # Force NR_CPUS=8 override in case defconfig/vendor ignores KCONFIG_ALLCONFIG
+          sed -i 's/^# CONFIG_NR_CPUS is not set$/CONFIG_NR_CPUS=8/' out/.config
+          sed -i 's/^CONFIG_NR_CPUS=.*/CONFIG_NR_CPUS=8/' out/.config
+          # Re-run olddefconfig to propagate the change without prompts
+          make O=out ARCH=arm64 olddefconfig
           echo "==== Ensured config ===="
           grep -E '^CONFIG_QTI_GVM=|^CONFIG_NR_CPUS=|^CONFIG_HUGETLB_PAGE=|^CONFIG_HUGETLBFS=' out/.config || true
 
