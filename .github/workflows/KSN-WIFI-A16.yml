@@ -62,8 +62,21 @@ jobs:
           pte_t *ptep = NULL;' arch/arm64/mm/hugetlbpage.c
           # Replace faulty assignment at line 235 with conditional to avoid double-call or null issues
           sed -i '235s/ptep = huge_pmd_share(mm, vma, addr, pud);/if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);/' arch/arm64/mm/hugetlbpage.c
-          echo "Patch applied:"
+          echo "Hugetlb patch applied:"
           grep -A5 -B2 "ptep =" arch/arm64/mm/hugetlbpage.c | head -10
+
+      - name: Apply taskstats fix patch
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          # Add missing #include <linux/mm.h> for sysstats_fill_zoneinfo declaration (after existing includes, ~line 20)
+          sed -i '20a #include <linux/mm.h>' kernel/taskstats.c
+          # Fix #elif syntax at line 483: insert #if CONFIG_MEMCG && CONFIG_SYSFS above it if missing
+          sed -i '483i #if CONFIG_MEMCG \&\& CONFIG_SYSFS' kernel/taskstats.c
+          # Ensure #endif matches (add after line 516 block)
+          sed -i '517a #endif /* CONFIG_MEMCG \&\& CONFIG_SYSFS */' kernel/taskstats.c
+          echo "Taskstats patch applied:"
+          sed -n '475,525p' kernel/taskstats.c | head -20
 
       - name: Set up ccache
         uses: hendrikmuhs/ccache-action@v1.2
@@ -113,7 +126,7 @@ jobs:
           mkdir -p out
           make O=out ARCH=arm64 ${KERNEL_DEFCONFIG}
 
-      # 2) Non-interactive finalize: preseed QTI_GVM, NR_CPUS=8, and accept defaults for any new symbols
+      # 2) Non-interactive finalize: preseed options and accept defaults for any new symbols
       - name: Finalize kernel config (non-interactive)
         working-directory: kernel
         run: |
@@ -124,15 +137,16 @@ jobs:
           CONFIG_NR_CPUS=8
           CONFIG_HUGETLB_PAGE=n
           CONFIG_HUGETLBFS=n
+          CONFIG_BTRFS_FS=n
           EOF
           make O=out ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../ci.defaults
           # Force NR_CPUS=8 override in case defconfig/vendor ignores KCONFIG_ALLCONFIG
           sed -i 's/^# CONFIG_NR_CPUS is not set$/CONFIG_NR_CPUS=8/' out/.config
           sed -i 's/^CONFIG_NR_CPUS=.*/CONFIG_NR_CPUS=8/' out/.config
-          # Re-run olddefconfig to propagate the change without prompts
+          # Re-run olddefconfig to propagate changes without prompts
           make O=out ARCH=arm64 olddefconfig
           echo "==== Ensured config ===="
-          grep -E '^CONFIG_QTI_GVM=|^CONFIG_NR_CPUS=|^CONFIG_HUGETLB_PAGE=|^CONFIG_HUGETLBFS=' out/.config || true
+          grep -E '^CONFIG_QTI_GVM=|^CONFIG_NR_CPUS=|^CONFIG_HUGETLB_PAGE=|^CONFIG_BTRFS_FS=' out/.config || true
 
       # 3) Only after config is finalized, build scripts/headers
       - name: Prepare scripts and headers
@@ -190,7 +204,7 @@ jobs:
           make ${KERNEL_CMDLINE} modules_prepare CC="ccache clang-18"
           make ${KERNEL_CMDLINE} CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j"$(nproc)" M=drivers/staging/qcacld-3.0 modules
           sudo mkdir -p ../modules/vendor/lib/modules
-          sudo find out/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ ;
+          sudo find out/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \;
           sudo chown -R "$(id -u)":"$(id -g)" ../modules
 
       - name: Package Kernel
