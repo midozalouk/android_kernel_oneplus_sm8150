@@ -1,4 +1,4 @@
-name: Build kernel (KSN) & WIFI for Android 16
+name: Build kernel (KSN) & WIFI A16
 
 on:
   workflow_dispatch:
@@ -34,7 +34,7 @@ jobs:
       CCACHE_NOHASHDIR: "true"
       CCACHE_MAXSIZE: "2G"
       CCACHE_HARDLINK: "true"
-      # Updated CROSS prefixes to match Ubuntu cross-binutils for Android 16 builds.
+      # Android 16: use LLVM toolchain and Ubuntu cross-binutils; O=out is kept to match Copilot’s flow
       KERNEL_CMDLINE: "ARCH=arm64 LLVM=1 LLVM_IAS=1 O=out CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu-"
       KERNEL_DEFCONFIG:  ${{ github.event.inputs.kernel_defconfig || 'lineage_sm8150_defconfig' }}
       KERNEL_SOURCE_URL: ${{ github.event.inputs.kernel_source_url || 'https://github.com/LineageOS/android_kernel_oneplus_sm8150' }}
@@ -42,127 +42,193 @@ jobs:
       OUTPUT_ZIP_NAME: ${{ github.event.inputs.output_name || 'OP7_KSN_wifi' }}
 
     steps:
-    - name: Checkout Kernel Source
-      run: |
-        git clone --depth=1 --branch "${KERNEL_BRANCH}" "${KERNEL_SOURCE_URL}" kernel
-        cd kernel
-        git submodule update --init --recursive
-        cd ..
-      env:
-        KERNEL_SOURCE_URL: ${{ env.KERNEL_SOURCE_URL }}
-        KERNEL_BRANCH: ${{ env.KERNEL_BRANCH }}
+      # Copilot: checkout with full history (needed if you compute versioning or diff), safe per docs
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Set up ccache
-      uses: hendrikmuhs/ccache-action@v1.2
+      - name: Checkout Kernel Source
+        run: |
+          git clone --depth=1 --branch "${KERNEL_BRANCH}" "${KERNEL_SOURCE_URL}" kernel
+          cd kernel
+          git submodule update --init --recursive
+          cd ..
+        env:
+          KERNEL_SOURCE_URL: ${{ env.KERNEL_SOURCE_URL }}
+          KERNEL_BRANCH: ${{ env.KERNEL_BRANCH }}
 
-    - name: Cleanup space
-      run: |
-        sudo rm -rf /opt/ghc
-        sudo rm -rf "/usr/local/share/boost"
-        sudo rm -rf /usr/share/dotnet
-        sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
 
-    - name: Install dependencies (LLVM 18 + cross-binutils)
-      run: |
-        sudo apt-get update -y
-        sudo apt-get install -y \
-          clang-18 llvm-18 lld-18 \
-          gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
-          binutils-aarch64-linux-gnu binutils \
-          make python3 libssl-dev build-essential bc bison flex unzip \
-          ca-certificates xz-utils mkbootimg cpio device-tree-compiler git git-lfs
-        # No need for Android GCC 4.9 prebuilts on Android 16; rely on LLVM and Ubuntu cross-binutils.
+      - name: Cleanup space
+        run: |
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
-    - name: Remove unnecessary files
-      run: |
-        sudo rm -rf /opt/ghc
-        sudo rm -rf "/usr/local/share/boost"
-        sudo rm -rf /usr/share/dotnet
-        sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+      # Switch to LLVM 18/lld 18 on ubuntu-latest (24.04) and use Ubuntu cross-binutils for Android 16
+      - name: Install dependencies (LLVM 18 + cross-binutils)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            clang-18 llvm-18 lld-18 \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            binutils-aarch64-linux-gnu binutils \
+            make python3 libssl-dev build-essential bc bison flex unzip \
+            ca-certificates xz-utils mkbootimg cpio device-tree-compiler git git-lfs
+          # AnyKernel3 template for packaging
+          git clone https://github.com/khalidaboelmagd/AnyKernel3
+          rm -rf AnyKernel3/.git
 
-    - name: Get Version
-      id: get_version
-      run: |
-        cd kernel
-        git fetch --unshallow || true
-        COUNT=$(git rev-list --count HEAD)
-        echo "VERSION=$(expr ${COUNT:-0} + 10200)" >> $GITHUB_OUTPUT
-        cd ..
+      - name: Remove unnecessary files
+        run: |
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
-    - name: KernelSU-Next setup
-      working-directory: ./kernel
-      run: |
-        export PATH=/usr/lib/llvm-18/bin:$PATH
-        curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
+      - name: Get Version
+        id: get_version
+        run: |
+          cd kernel
+          git fetch --unshallow || true
+          COUNT=$(git rev-list --count HEAD)
+          echo "VERSION=$(expr ${COUNT:-0} + 10200)" >> $GITHUB_OUTPUT
+          cd ..
 
-    - name: Configure kernel
-      working-directory: ./kernel
-      run: |
-        export PATH=/usr/lib/llvm-18/bin:$PATH
-        # Ensure host tools use clang to avoid vdso/host-tool failures.
-        export HOSTCC=clang-18
-        export HOSTCXX=clang++-18
-        # Generate and finalize config.
-        make $KERNEL_CMDLINE $KERNEL_DEFCONFIG CC="ccache clang-18"
-        make $KERNEL_CMDLINE olddefconfig CC="ccache clang-18"
-        # Prepare scripts/headers.
-        make $KERNEL_CMDLINE scripts CC="ccache clang-18"
-        make $KERNEL_CMDLINE prepare CC="ccache clang-18"
+      # KernelSU-Next integration remains as in your working config
+      - name: KernelSU-Next setup
+        working-directory: ./kernel
+        run: |
+          export PATH=/usr/lib/llvm-18/bin:$PATH
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
 
-    - name: Build kernel
-      working-directory: ./kernel
-      run: |
-        export PATH=/usr/lib/llvm-18/bin:$PATH
-        export LD_LIBRARY_PATH=/usr/lib/llvm-18/lib:$LD_LIBRARY_PATH
-        export DTC_EXT=dtc
-        # Build kernel with full LLVM toolchain.
-        make $KERNEL_CMDLINE CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j$(nproc --all)
-        cp out/arch/arm64/boot/Image ../AnyKernel3 || { echo "Image not found"; exit 1; }
+      # Copilot: create O=out defconfig; honor your selected defconfig instead of plain 'defconfig'
+      - name: Prepare kernel output directory (defconfig)
+        working-directory: kernel
+        run: |
+          set -e
+          export PATH=/usr/lib/llvm-18/bin:$PATH
+          export HOSTCC=clang-18
+          export HOSTCXX=clang++-18
+          make O=out $KERNEL_DEFCONFIG
 
-    - name: Build Wi-Fi Module (qca_cld3)
-      working-directory: ./kernel
-      run: |
-        export PATH=/usr/lib/llvm-18/bin:$PATH
-        export LD_LIBRARY_PATH=/usr/lib/llvm-18/lib:$LD_LIBRARY_PATH
-        # Ensure the same toolchain/flags for modules to keep vermagic/ABI aligned.
-        make $KERNEL_CMDLINE modules_prepare CC="ccache clang-18"
-        make $KERNEL_CMDLINE CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j$(nproc --all) M=drivers/staging/qcacld-3.0 modules
-        sudo mkdir -p ../modules/vendor/lib/modules
-        sudo find out/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \;
-        sudo chown -R $(id -u):$(id -g) ../modules
+      # Copilot: adjust .config non-interactively, then olddefconfig to resolve deps
+      - name: Fix kernel config for CI (no source changes)
+        working-directory: kernel
+        run: |
+          set -e
+          export PATH=/usr/lib/llvm-18/bin:$PATH
+          OUT_CONFIG=out/.config
 
-    - name: Package Kernel
-      run: |
-        git clone https://github.com/khalidaboelmagd/AnyKernel3
-        rm -rf AnyKernel3/.git
-        echo "Packaging kernel from: $(pwd)"
-        ls -la AnyKernel3/
-        cd AnyKernel3
-        zip -r ../${{ env.OUTPUT_ZIP_NAME }}.zip *
-        cd ..
+          if [ ! -f "$OUT_CONFIG" ]; then
+            echo "No $OUT_CONFIG found, generating defconfig"
+            make O=out $KERNEL_DEFCONFIG
+          fi
 
-    - name: Package Wi-Fi Module
-      run: |
-        if [ ! -d "modules/vendor/lib/modules" ] || ! ls modules/vendor/lib/modules/*.ko >/dev/null 2>&1; then
-          echo "Error: No Wi-Fi modules found to package!"
-          exit 1
-        fi
-        cd modules
-        zip -r ../${{ env.OUTPUT_ZIP_NAME }}-modules.zip *
-        cd ..
+          if [ -x scripts/config ]; then
+            echo "Using scripts/config to update config"
+            ./scripts/config --file "$OUT_CONFIG" --set-val CONFIG_NR_CPUS 64 || true
+            ./scripts/config --file "$OUT_CONFIG" --disable CONFIG_HUGETLB_PAGE || true
+            ./scripts/config --file "$OUT_CONFIG" --disable CONFIG_HUGETLBFS || true
+            make O=out olddefconfig
+          else
+            echo "scripts/config not found, editing $OUT_CONFIG directly"
+            sed -i '/^CONFIG_NR_CPUS=/d' "$OUT_CONFIG" || true
+            echo 'CONFIG_NR_CPUS=64' >> "$OUT_CONFIG"
+            sed -i '/^CONFIG_HUGETLB_PAGE=/d' "$OUT_CONFIG" || true
+            echo 'CONFIG_HUGETLB_PAGE=n' >> "$OUT_CONFIG"
+            sed -i '/^CONFIG_HUGETLBFS=/d' "$OUT_CONFIG" || true
+            echo 'CONFIG_HUGETLBFS=n' >> "$OUT_CONFIG"
+            make O=out olddefconfig
+          fi
 
-    - name: Upload to Release
-      uses: softprops/action-gh-release@v2
-      with:
-        files: |
-          ${{ env.OUTPUT_ZIP_NAME }}.zip
-          ${{ env.OUTPUT_ZIP_NAME }}-modules.zip
-        name: ${{ env.OUTPUT_ZIP_NAME }}-${{ steps.get_version.outputs.VERSION }}
-        tag_name: ${{ steps.get_version.outputs.VERSION }}
-        body: |
-          Device: Oneplus 7/Oneplus 7Pro/Oneplus 7T/Oneplus 7TPro
-          Includes:
-          - Kernel Image
-          - qca_cld3 Wi-Fi Module (vermagic matched)
-      env:
-        GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          echo "==== Effective kernel config adjustments ===="
+          grep -E '^CONFIG_NR_CPUS=|^CONFIG_HUGETLB' out/.config || true
+
+      # Your original prepare calls retained for completeness
+      - name: Prepare scripts and headers
+        working-directory: ./kernel
+        run: |
+          export PATH=/usr/lib/llvm-18/bin:$PATH
+          export HOSTCC=clang-18
+          export HOSTCXX=clang++-18
+          make $KERNEL_CMDLINE scripts CC="ccache clang-18"
+          make $KERNEL_CMDLINE prepare CC="ccache clang-18"
+
+      # Copilot: build using O=out; keep LLVM 18 and explicit LLVM binutils to avoid vdso/host-tool/linker mismatches
+      - name: Build kernel
+        working-directory: kernel
+        env:
+          KBUILD_OUTPUT: out
+        run: |
+          set -e
+          export PATH=/usr/lib/llvm-18/bin:$PATH
+          export LD_LIBRARY_PATH=/usr/lib/llvm-18/lib:$LD_LIBRARY_PATH
+          export DTC_EXT=dtc
+          export HOSTCC=clang-18
+          export HOSTCXX=clang++-18
+          make $KERNEL_CMDLINE CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j"$(nproc)"
+          cp out/arch/arm64/boot/Image ../AnyKernel3
+
+      - name: Run simple verification on build output
+        working-directory: kernel
+        run: |
+          set -e
+          if [ -d out ]; then
+            echo "Build output exists:"
+            ls -lah out | sed -n '1,200p'
+          else
+            echo "No build output directory found"
+            exit 1
+          fi
+
+      # Build the Wi-Fi module with the exact same toolchain/env to match vermagic/KMI
+      - name: Build Wi-Fi Module (qca_cld3)
+        working-directory: ./kernel
+        run: |
+          export PATH=/usr/lib/llvm-18/bin:$PATH
+          export LD_LIBRARY_PATH=/usr/lib/llvm-18/lib:$LD_LIBRARY_PATH
+          export HOSTCC=clang-18
+          export HOSTCXX=clang++-18
+
+          make $KERNEL_CMDLINE modules_prepare CC="ccache clang-18"
+          make $KERNEL_CMDLINE CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j"$(nproc)" M=drivers/staging/qcacld-3.0 modules
+
+          sudo mkdir -p ../modules/vendor/lib/modules
+          sudo find out/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \;
+          sudo chown -R "$(id -u)":"$(id -g)" ../modules
+
+      - name: Package Kernel
+        run: |
+          echo "Packaging kernel from: $(pwd)"
+          ls -la AnyKernel3/ || true
+          cd AnyKernel3
+          zip -r ../${{ env.OUTPUT_ZIP_NAME }}.zip *
+          cd ..
+
+      - name: Package Wi-Fi Module
+        run: |
+          if [ ! -d "modules/vendor/lib/modules" ] || ! ls modules/vendor/lib/modules/*.ko >/dev/null 2>&1; then
+            echo "Error: No Wi-Fi modules found to package!"
+            exit 1
+          fi
+          echo "Packaging modules from: $(pwd)/modules"
+          ls -la modules/vendor/lib/modules/
+          cd modules
+          zip -r ../${{ env.OUTPUT_ZIP_NAME }}-modules.zip *
+          cd ..
+
+      - name: Upload kernel build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-out
+          path: kernel/out
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel
