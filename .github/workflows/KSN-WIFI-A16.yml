@@ -58,12 +58,12 @@ jobs:
         working-directory: kernel
         run: |
           set -euo pipefail
-          # Insert a ptep declaration close to existing pte declaration
+          # Insert a ptep declaration near existing pte declaration (line number heuristic; ignore if already present)
           sed -i '208a \
           pte_t *ptep = NULL;' arch/arm64/mm/hugetlbpage.c || true
-          # Guard the huge_pmd_share assignment to avoid duplicate/conflicts
+          # Guard the huge_pmd_share assignment (line number heuristic)
           sed -i '235s/ptep = huge_pmd_share(mm, vma, addr, pud);/if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);/' arch/arm64/mm/hugetlbpage.c || true
-          echo "[hugetlbpage] Context:"
+          echo "[hugetlbpage] Context (200-245):"
           sed -n '200,245p' arch/arm64/mm/hugetlbpage.c || true
 
       # Patch 2: mm/huge_memory.c (update try_to_unmap signature to 3 args)
@@ -122,22 +122,14 @@ jobs:
           mkdir -p out
           make O=out ARCH=arm64 ${KERNEL_DEFCONFIG}
 
-      # Build scripts so scripts/config is available for post-olddefconfig enforcement
-      - name: Build Kconfig tools
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-          export PATH=/usr/lib/llvm-18/bin:$PATH
-          make O=out scripts
-
-      # 2) Non-interactive finalize + hard enforcement (BTRFS/TASKSTATS off, NR_CPUS=8)
+      # 2) Non-interactive finalize + hard enforcement (BTRFS/TASKSTATS off, NR_CPUS=8, compression, etc.)
       - name: Finalize kernel config (non-interactive + enforce)
         working-directory: kernel
         run: |
           set -euo pipefail
           export PATH=/usr/lib/llvm-18/bin:$PATH
 
-          # Preseed defaults to avoid interactive prompts and to target phone-kernel needs
+          # Preseed defaults to avoid any Kconfig prompts
           cat > ../ci.defaults <<'EOF'
           CONFIG_QTI_GVM=n
           CONFIG_NR_CPUS=8
@@ -149,36 +141,71 @@ jobs:
           CONFIG_TASK_DELAY_ACCT=n
           CONFIG_TASK_XACCT=n
           CONFIG_TASK_IO_ACCOUNTING=n
+          # General setup prompts that appeared:
+          CONFIG_COMPILE_TEST=n
+          CONFIG_LOCALVERSION=""
+          CONFIG_LOCALVERSION_AUTO=y
+          CONFIG_KERNEL_GZIP=y
+          CONFIG_KERNEL_BZIP2=n
+          CONFIG_KERNEL_LZMA=n
+          CONFIG_KERNEL_XZ=n
+          CONFIG_KERNEL_LZO=n
+          CONFIG_KERNEL_LZ4=n
+          # Tool prefix prompt:
+          CONFIG_CROSS_COMPILE="aarch64-linux-gnu-"
           EOF
 
           # Apply defaults non-interactively
           make O=out ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../ci.defaults
 
-          # Hard-enforce critical toggles that vendor/defconfig might flip back
-          ./scripts/config --file out/.config \
-            --disable CONFIG_QTI_GVM \
-            --set-val CONFIG_NR_CPUS 8 \
-            --disable CONFIG_HUGETLB_PAGE \
-            --disable CONFIG_HUGETLBFS \
-            --disable CONFIG_BTRFS_FS \
-            --disable CONFIG_BTRFS_FS_POSIX_ACL \
-            --disable CONFIG_TASKSTATS \
-            --disable CONFIG_TASK_DELAY_ACCT \
-            --disable CONFIG_TASK_XACCT \
-            --disable CONFIG_TASK_IO_ACCOUNTING || true
+          # Hard-enforce critical toggles that may flip back via vendor/defconfig
+          # Prefer scripts/config if present, else fallback to sed below
+          if [ -x scripts/config ]; then
+            ./scripts/config --file out/.config \
+              --disable CONFIG_QTI_GVM \
+              --set-val CONFIG_NR_CPUS 8 \
+              --disable CONFIG_HUGETLB_PAGE \
+              --disable CONFIG_HUGETLBFS \
+              --disable CONFIG_BTRFS_FS \
+              --disable CONFIG_BTRFS_FS_POSIX_ACL \
+              --disable CONFIG_TASKSTATS \
+              --disable CONFIG_TASK_DELAY_ACCT \
+              --disable CONFIG_TASK_XACCT \
+              --disable CONFIG_TASK_IO_ACCOUNTING \
+              --disable CONFIG_COMPILE_TEST \
+              --set-str CONFIG_LOCALVERSION "" \
+              --enable CONFIG_LOCALVERSION_AUTO \
+              --enable CONFIG_KERNEL_GZIP \
+              --disable CONFIG_KERNEL_BZIP2 \
+              --disable CONFIG_KERNEL_LZMA \
+              --disable CONFIG_KERNEL_XZ \
+              --disable CONFIG_KERNEL_LZO \
+              --disable CONFIG_KERNEL_LZ4 || true
+          fi
 
-          # Fallback sed in case scripts/config missed anything
+          # Fallback sed to ensure enforcement
           sed -i 's/^CONFIG_BTRFS_FS=m/CONFIG_BTRFS_FS=n/' out/.config
           sed -i 's/^CONFIG_BTRFS_FS_POSIX_ACL=.*/CONFIG_BTRFS_FS_POSIX_ACL=n/' out/.config
           sed -i 's/^# CONFIG_NR_CPUS is not set$/CONFIG_NR_CPUS=8/' out/.config
           sed -i 's/^CONFIG_NR_CPUS=.*/CONFIG_NR_CPUS=8/' out/.config
           sed -i 's/^CONFIG_TASKSTATS=.*/CONFIG_TASKSTATS=n/' out/.config
+          # Compression choice: force gzip, disable others
+          sed -i 's/^CONFIG_KERNEL_GZIP=.*/CONFIG_KERNEL_GZIP=y/' out/.config
+          for c in CONFIG_KERNEL_BZIP2 CONFIG_KERNEL_LZMA CONFIG_KERNEL_XZ CONFIG_KERNEL_LZO CONFIG_KERNEL_LZ4; do
+            sed -i "s/^${c}=.*/${c}=n/" out/.config
+          done
+          # Cross-compile string (only if prompt exists in this tree)
+          if ! grep -q '^CONFIG_CROSS_COMPILE=' out/.config; then
+            echo 'CONFIG_CROSS_COMPILE="aarch64-linux-gnu-"' >> out/.config
+          else
+            sed -i 's/^CONFIG_CROSS_COMPILE=.*/CONFIG_CROSS_COMPILE="aarch64-linux-gnu-"/' out/.config
+          fi
 
           # Re-resolve dependencies non-interactively
           make O=out ARCH=arm64 olddefconfig
 
           echo "==== Ensured config ===="
-          egrep -E '^(CONFIG_QTI_GVM|CONFIG_NR_CPUS|CONFIG_HUGETLB_PAGE|CONFIG_BTRFS_FS|CONFIG_TASKSTATS)=' out/.config || true
+          egrep -E '^(CONFIG_QTI_GVM|CONFIG_NR_CPUS|CONFIG_HUGETLB_PAGE|CONFIG_BTRFS_FS|CONFIG_TASKSTATS|CONFIG_KERNEL_GZIP)=' out/.config || true
 
       # 3) Only after config is finalized, build scripts/headers
       - name: Prepare scripts and headers
