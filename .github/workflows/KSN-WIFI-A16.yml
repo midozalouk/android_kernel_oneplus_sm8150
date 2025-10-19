@@ -1,5 +1,5 @@
 name: Build kernel (KSN) & WIFI A16
- 
+
 on:
   workflow_dispatch:
     inputs:
