@@ -1,5 +1,5 @@
 name: Build kernel (KSN) & WIFI A16
-
+ 
 on:
   workflow_dispatch:
     inputs:
@@ -34,9 +34,8 @@ jobs:
       CCACHE_NOHASHDIR: "true"
       CCACHE_MAXSIZE: "2G"
       CCACHE_HARDLINK: "true"
-      # Use Ubuntu cross-binutils names with LLVM=1
       KERNEL_CMDLINE: "ARCH=arm64 LLVM=1 LLVM_IAS=1 O=out CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu-"
-      KERNEL_DEFCONFIG:  ${{ github.event.inputs.kernel_defconfig || 'lineage_sm8150_defconfig' }}
+      KERNEL_DEFCONFIG: ${{ github.event.inputs.kernel_defconfig || 'lineage_sm8150_defconfig' }}
       KERNEL_SOURCE_URL: ${{ github.event.inputs.kernel_source_url || 'https://github.com/LineageOS/android_kernel_oneplus_sm8150' }}
       KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch || 'lineage-22.1' }}
       OUTPUT_ZIP_NAME: ${{ github.event.inputs.output_name || 'OP7_KSN_wifi' }}
@@ -91,27 +90,53 @@ jobs:
           export PATH=/usr/lib/llvm-18/bin:$PATH
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
 
-      # Patch: arch/arm64/mm/hugetlbpage.c undeclared ptep + guarded assignment
+      # Patch A: arch/arm64/mm/hugetlbpage.c (declare ptep, guard huge_pmd_share) - pattern-based, idempotent
       - name: Apply hugetlbpage fix patch
         working-directory: kernel
         run: |
           set -euo pipefail
-          # Insert ptep declaration near the pte declaration; ignore if already present
           if ! grep -q 'pte_t \*ptep' arch/arm64/mm/hugetlbpage.c; then
-            awk 'NR==208{print;print "pte_t *ptep = NULL;";next}1' arch/arm64/mm/hugetlbpage.c > f && mv f arch/arm64/mm/hugetlbpage.c || true
+            sed -i '/pte_t \*pte = NULL;/a \  pte_t *ptep = NULL;' arch/arm64/mm/hugetlbpage.c || true
           fi
-          # Guard huge_pmd_share assignment
           sed -i 's/ptep = huge_pmd_share(mm, vma, addr, pud);/if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);/' arch/arm64/mm/hugetlbpage.c || true
-          echo "[hugetlbpage] Context (near ptep and huge_pmd_share):"
-          sed -n '200,245p' arch/arm64/mm/hugetlbpage.c || true
+          grep -n 'ptep' arch/arm64/mm/hugetlbpage.c || true
 
-      # Optional MM API skew: update 2-arg try_to_unmap to 3-arg (safe no-op vma=NULL)
+      # Patch B: mm/huge_memory.c try_to_unmap signature shim (add NULL 3rd arg)
       - name: Apply huge_memory try_to_unmap signature patch
         working-directory: kernel
         run: |
           set -euo pipefail
           sed -i 's/try_to_unmap(page, ttu_flags);/try_to_unmap(page, ttu_flags, NULL);/g' mm/huge_memory.c || true
-          echo "[huge_memory] try_to_unmap calls updated (if present)."
+
+      # Patch C: fs/proc/task_mmu.c fix split_huge_pmd arg order; use extended regex for whitespace
+      - name: Fix split_huge_pmd call order
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          sed -Ei 's/split_huge_pmd\(([[:space:]]*)vma([[:space:]]*),([[:space:]]*)addr([[:space:]]*),([[:space:]]*)pmd([[:space:]]*)\);/split_huge_pmd(vma, pmd, addr);/' fs/proc/task_mmu.c || true
+          grep -n 'split_huge_pmd' fs/proc/task_mmu.c || true
+
+      # Patch D: mm/khugepaged.c remove obsolete mm->nr_ptes usage to avoid API skew build break
+      - name: Neutralize mm->nr_ptes in khugepaged
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          sed -i 's/atomic_long_dec(&mm->nr_ptes);/\/\* compat: mm->nr_ptes removed in this tree \*\/ do {} while (0);/' mm/khugepaged.c || true
+          grep -n 'nr_ptes' mm/khugepaged.c || true
+
+      # Patch E: Filter out NFS/LOCKD/SUNRPC dirs at the make level, in case vendor fragments re-enable them
+        # This ensures they won’t be built even if .config flips unexpectedly.
+      - name: Filter NFS/LOCKD/SUNRPC subdirs from fs/Makefile
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          {
+            echo ''
+            echo '# CI filter: prevent NFS/LOCKD/SUNRPC from building regardless of Kconfig'
+            echo 'subdir-y := $(filter-out nfs lockd nfs_common sunrpc,$(subdir-y))'
+            echo 'subdir-m := $(filter-out nfs lockd nfs_common sunrpc,$(subdir-m))'
+          } >> fs/Makefile
+          tail -n 6 fs/Makefile || true
 
       # 1) Seed .config into O=out
       - name: Prepare kernel output directory (defconfig)
@@ -124,25 +149,31 @@ jobs:
           mkdir -p out
           make O=out ARCH=arm64 ${KERNEL_DEFCONFIG}
 
-      # 2) Non-interactive finalize + hard enforcement (avoid prompts and prevent regressions)
+      # 2) Non-interactive finalize + hard enforcement to avoid prompts and API skews
       - name: Finalize kernel config (non-interactive + enforce)
         working-directory: kernel
         run: |
           set -euo pipefail
           export PATH=/usr/lib/llvm-18/bin:$PATH
-
-          # Preseed defaults to avoid interactive Kconfig (compression, COMPILE_TEST, etc.)
           cat > ../ci.defaults <<'EOF'
           CONFIG_QTI_GVM=n
           CONFIG_NR_CPUS=8
           CONFIG_HUGETLB_PAGE=n
           CONFIG_HUGETLBFS=n
+          CONFIG_TRANSPARENT_HUGEPAGE=n
+          CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS=n
+          CONFIG_TRANSPARENT_HUGEPAGE_MADVISE=n
+          CONFIG_KSM=n
           CONFIG_BTRFS_FS=n
           CONFIG_BTRFS_FS_POSIX_ACL=n
           CONFIG_TASKSTATS=n
           CONFIG_TASK_DELAY_ACCT=n
           CONFIG_TASK_XACCT=n
           CONFIG_TASK_IO_ACCOUNTING=n
+          CONFIG_NFS_FS=n
+          CONFIG_NFS_V4=n
+          CONFIG_LOCKD=n
+          CONFIG_SUNRPC=n
           CONFIG_COMPILE_TEST=n
           CONFIG_LOCALVERSION=""
           CONFIG_LOCALVERSION_AUTO=y
@@ -154,33 +185,31 @@ jobs:
           CONFIG_KERNEL_LZ4=n
           CONFIG_CROSS_COMPILE="aarch64-linux-gnu-"
           EOF
-
           make O=out ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../ci.defaults
 
-          # Use scripts/config if available to hard-enforce critical toggles
           if [ -x scripts/config ]; then
             ./scripts/config --file out/.config \
               --disable CONFIG_QTI_GVM \
               --set-val CONFIG_NR_CPUS 8 \
               --disable CONFIG_HUGETLB_PAGE --disable CONFIG_HUGETLBFS \
+              --disable CONFIG_TRANSPARENT_HUGEPAGE --disable CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS --disable CONFIG_TRANSPARENT_HUGEPAGE_MADVISE \
+              --disable CONFIG_KSM \
               --disable CONFIG_BTRFS_FS --disable CONFIG_BTRFS_FS_POSIX_ACL \
-              --disable CONFIG_TASKSTATS --disable CONFIG_TASK_DELAY_ACCT \
-              --disable CONFIG_TASK_XACCT --disable CONFIG_TASK_IO_ACCOUNTING \
+              --disable CONFIG_TASKSTATS --disable CONFIG_TASK_DELAY_ACCT --disable CONFIG_TASK_XACCT --disable CONFIG_TASK_IO_ACCOUNTING \
+              --disable CONFIG_NFS_FS --disable CONFIG_NFS_V4 --disable CONFIG_LOCKD --disable CONFIG_SUNRPC \
               --disable CONFIG_COMPILE_TEST \
-              --set-str CONFIG_LOCALVERSION "" \
-              --enable CONFIG_LOCALVERSION_AUTO \
+              --set-str CONFIG_LOCALVERSION "" --enable CONFIG_LOCALVERSION_AUTO \
               --enable CONFIG_KERNEL_GZIP \
-              --disable CONFIG_KERNEL_BZIP2 --disable CONFIG_KERNEL_LZMA \
-              --disable CONFIG_KERNEL_XZ --disable CONFIG_KERNEL_LZO --disable CONFIG_KERNEL_LZ4 || true
+              --disable CONFIG_KERNEL_BZIP2 --disable CONFIG_KERNEL_LZMA --disable CONFIG_KERNEL_XZ --disable CONFIG_KERNEL_LZO --disable CONFIG_KERNEL_LZ4 || true
           fi
 
-          # Fallback sed enforcement
+          # Sed fallback to ensure enforcement
           sed -i 's/^CONFIG_BTRFS_FS=m/CONFIG_BTRFS_FS=n/' out/.config
-          sed -i 's/^CONFIG_BTRFS_FS_POSIX_ACL=.*/CONFIG_BTRFS_FS_POSIX_ACL=n/' out/.config
+          for s in CONFIG_BTRFS_FS_POSIX_ACL CONFIG_TASKSTATS CONFIG_TASK_DELAY_ACCT CONFIG_TASK_XACCT CONFIG_TASK_IO_ACCOUNTING CONFIG_NFS_FS CONFIG_NFS_V4 CONFIG_LOCKD CONFIG_SUNRPC CONFIG_HUGETLB_PAGE CONFIG_HUGETLBFS CONFIG_TRANSPARENT_HUGEPAGE CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS CONFIG_TRANSPARENT_HUGEPAGE_MADVISE CONFIG_KSM CONFIG_COMPILE_TEST; do
+            sed -i "s/^${s}=.*/${s}=n/" out/.config
+          done
           sed -i 's/^# CONFIG_NR_CPUS is not set$/CONFIG_NR_CPUS=8/' out/.config
           sed -i 's/^CONFIG_NR_CPUS=.*/CONFIG_NR_CPUS=8/' out/.config
-          sed -i 's/^CONFIG_TASKSTATS=.*/CONFIG_TASKSTATS=n/' out/.config
-          sed -i 's/^CONFIG_COMPILE_TEST=.*/CONFIG_COMPILE_TEST=n/' out/.config
           sed -i 's/^CONFIG_KERNEL_GZIP=.*/CONFIG_KERNEL_GZIP=y/' out/.config
           for c in CONFIG_KERNEL_BZIP2 CONFIG_KERNEL_LZMA CONFIG_KERNEL_XZ CONFIG_KERNEL_LZO CONFIG_KERNEL_LZ4; do
             sed -i "s/^${c}=.*/${c}=n/" out/.config
@@ -191,13 +220,13 @@ jobs:
             sed -i 's/^CONFIG_CROSS_COMPILE=.*/CONFIG_CROSS_COMPILE="aarch64-linux-gnu-"/' out/.config
           fi
 
-          # Re-resolve dependencies non-interactively and generate auto.conf
+          # Re-resolve deps and write auto.conf
           make O=out ARCH=arm64 olddefconfig
 
-          echo "==== Ensured config ===="
-          egrep -E '^(CONFIG_QTI_GVM|CONFIG_NR_CPUS|CONFIG_HUGETLB_PAGE|CONFIG_BTRFS_FS|CONFIG_TASKSTATS|CONFIG_KERNEL_GZIP)=' out/.config || true
+          echo "==== Key config lines ===="
+          egrep -E '^(CONFIG_QTI_GVM|CONFIG_NR_CPUS|CONFIG_HUGETLB_PAGE|CONFIG_TRANSPARENT_HUGEPAGE|CONFIG_BTRFS_FS|CONFIG_TASKSTATS|CONFIG_NFS_FS|CONFIG_KERNEL_GZIP)=' out/.config || true
 
-      # 3) Only after config is finalized, build scripts/headers
+      # 3) After finalize, build scripts/headers
       - name: Prepare scripts and headers
         working-directory: ./kernel
         run: |
@@ -220,22 +249,20 @@ jobs:
           export HOSTCC=clang-18
           export HOSTCXX=clang++-18
 
-          # Safety: ensure Kconfig settled (non-interactive)
+          # Final safety olddefconfig
           make O=out ARCH=arm64 olddefconfig
 
-          # Verify critical configs before compile
+          # Verify critical toggles
           if ! grep -q '^CONFIG_NR_CPUS=8' out/.config; then
-            echo "Error: NR_CPUS not set to 8; check config"
+            echo "Error: NR_CPUS not set to 8"
             exit 1
           fi
-          if grep -q '^CONFIG_BTRFS_FS=[my]' out/.config; then
-            echo "Error: BTRFS still enabled; forcing off failed"
-            exit 1
-          fi
-          if grep -q '^CONFIG_TASKSTATS=[my]' out/.config; then
-            echo "Error: TASKSTATS still enabled; forcing off failed"
-            exit 1
-          fi
+          for s in CONFIG_BTRFS_FS CONFIG_TASKSTATS CONFIG_TRANSPARENT_HUGEPAGE CONFIG_NFS_FS; do
+            if grep -q "^${s}=[my]" out/.config; then
+              echo "Error: ${s} still enabled"
+              exit 1
+            fi
+          done
 
           make ${KERNEL_CMDLINE} CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j"$(nproc)"
           test -f out/arch/arm64/boot/Image
@@ -263,7 +290,6 @@ jobs:
           export HOSTCXX=clang++-18
 
           make ${KERNEL_CMDLINE} modules_prepare CC="ccache clang-18"
-
           make ${KERNEL_CMDLINE} CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" \
             OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" \
             -j"$(nproc)" M=drivers/staging/qcacld-3.0 modules
