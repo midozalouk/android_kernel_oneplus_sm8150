@@ -90,7 +90,7 @@ jobs:
           export PATH=/usr/lib/llvm-18/bin:$PATH
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
 
-      # Patch A: arch/arm64/mm/hugetlbpage.c (declare ptep, guard huge_pmd_share) - pattern-based, idempotent
+      # Patch A: arch/arm64/mm/hugetlbpage.c (declare ptep, guard huge_pmd_share)
       - name: Apply hugetlbpage fix patch
         working-directory: kernel
         run: |
@@ -107,19 +107,45 @@ jobs:
           set -euo pipefail
           sed -i 's/try_to_unmap(page, ttu_flags);/try_to_unmap(page, ttu_flags, NULL);/g' mm/huge_memory.c || true
 
-      # Patch C: fs/proc/task_mmu.c fix split_huge_pmd arg order (vma, addr, pmd) -> (vma, pmd, addr)
+      # Patch C: fs/proc/task_mmu.c fix split_huge_pmd arg order
       - name: Fix split_huge_pmd call order
         working-directory: kernel
         run: |
           set -euo pipefail
           sed -Ei 's/split_huge_pmd\(([[:space:]]*)vma([[:space:]]*),([[:space:]]*)addr([[:space:]]*),([[:space:]]*)pmd([[:space:]]*)\);/split_huge_pmd(vma, pmd, addr);/g' fs/proc/task_mmu.c || true
 
-      # Patch D: mm/khugepaged.c remove obsolete mm->nr_ptes usage (neutralize line to avoid API skew)
+      # Patch D: mm/khugepaged.c neutralize obsolete mm->nr_ptes usage
       - name: Neutralize mm->nr_ptes in khugepaged
         working-directory: kernel
         run: |
           set -euo pipefail
-          sed -i 's/atomic_long_dec(&mm->nr_ptes);/\/\* compat: mm->nr_ptes removed in this tree \*\/ do {} while (0);/' mm/khugepaged.c || true
+          sed -i 's/atomic_long_dec(&mm->nr_ptes);/\/\* compat: mm->nr_ptes removed \*\/ do {} while (0);/' mm/khugepaged.c || true
+
+      # Filter out entire drivers/clk/bcm directory (Broadcom clocks) to avoid iproc PLL build
+      - name: Filter BCM clock directory from drivers/clk/Makefile
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          {
+            echo ''
+            echo '# CI filter: prevent Broadcom clk drivers from building on sm8150'
+            echo 'subdir-y := $(filter-out bcm,$(subdir-y))'
+            echo 'subdir-m := $(filter-out bcm,$(subdir-m))'
+          } >> drivers/clk/Makefile
+          tail -n 6 drivers/clk/Makefile || true
+
+      # Optional safety: block ACPI directory too (kept from earlier fixes)
+      - name: Filter ACPI dir from drivers/Makefile
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          {
+            echo ''
+            echo '# CI filter: prevent ACPI from building on DT/arm64 Android'
+            echo 'subdir-y := $(filter-out acpi,$(subdir-y))'
+            echo 'subdir-m := $(filter-out acpi,$(subdir-m))'
+          } >> drivers/Makefile
+          tail -n 6 drivers/Makefile || true
 
       # 1) Seed .config into O=out
       - name: Prepare kernel output directory (defconfig)
@@ -132,14 +158,13 @@ jobs:
           mkdir -p out
           make O=out ARCH=arm64 ${KERNEL_DEFCONFIG}
 
-      # 2) Non-interactive finalize + hard enforcement (disable ACPI/THP/KSM/BTRFS/TASKSTATS/NFS; NR_CPUS=8; gzip)
+      # 2) Non-interactive finalize + aggressive enforcement (incl. IPv6 and BCM clk disables)
       - name: Finalize kernel config (non-interactive + enforce)
         working-directory: kernel
         run: |
           set -euo pipefail
           export PATH=/usr/lib/llvm-18/bin:$PATH
 
-          # Preseed all critical toggles to avoid Kconfig prompts and API skews
           cat > ../ci.defaults <<'EOF'
           CONFIG_QTI_GVM=n
           CONFIG_NR_CPUS=8
@@ -150,7 +175,7 @@ jobs:
           CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS=n
           CONFIG_TRANSPARENT_HUGEPAGE_MADVISE=n
           CONFIG_KSM=n
-          # Filesystems we don't need on Android
+          # Filesystems / features not needed
           CONFIG_BTRFS_FS=n
           CONFIG_BTRFS_FS_POSIX_ACL=n
           CONFIG_TASKSTATS=n
@@ -161,14 +186,26 @@ jobs:
           CONFIG_NFS_V4=n
           CONFIG_LOCKD=n
           CONFIG_SUNRPC=n
-          # ACPI should be off on DT-based Android devices (sm8150)
+          # Disable IPv6 and bulky L2 features that triggered errors
+          CONFIG_IPV6=n
+          CONFIG_BRIDGE=n
+          CONFIG_VLAN_8021Q=n
+          CONFIG_BT=n
+          CONFIG_9P_FS=n
+          CONFIG_NET_9P=n
+          # Broadcom common clocks off
+          CONFIG_COMMON_CLK_BCM=n
+          CONFIG_CLK_BCM_IPROC=n
+          CONFIG_CLK_BCM2835=n
+          # ACPI off
           CONFIG_ACPI=n
+          CONFIG_ACPI_EC=n
+          CONFIG_ACPI_LPSS=n
           CONFIG_ACPI_APEI=n
           CONFIG_ACPI_APD=n
-          CONFIG_ACPI_LPSS=n
           CONFIG_ACPI_PCI_SLOT=n
           CONFIG_ACPI_PCI_ROOT=n
-          # General setup/prevent prompts
+          # General non-interactive + compression
           CONFIG_COMPILE_TEST=n
           CONFIG_LOCALVERSION=""
           CONFIG_LOCALVERSION_AUTO=y
@@ -181,10 +218,9 @@ jobs:
           CONFIG_CROSS_COMPILE="aarch64-linux-gnu-"
           EOF
 
-          # Resolve all new symbols non-interactively
           make O=out ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../ci.defaults
 
-          # Enforce again (handle vendor flips); scripts/config if present, sed fallback otherwise
+          # scripts/config enforcement if available
           if [ -x scripts/config ]; then
             ./scripts/config --file out/.config \
               --disable CONFIG_QTI_GVM --set-val CONFIG_NR_CPUS 8 \
@@ -194,19 +230,23 @@ jobs:
               --disable CONFIG_BTRFS_FS --disable CONFIG_BTRFS_FS_POSIX_ACL \
               --disable CONFIG_TASKSTATS --disable CONFIG_TASK_DELAY_ACCT --disable CONFIG_TASK_XACCT --disable CONFIG_TASK_IO_ACCOUNTING \
               --disable CONFIG_NFS_FS --disable CONFIG_NFS_V4 --disable CONFIG_LOCKD --disable CONFIG_SUNRPC \
-              --disable CONFIG_ACPI --disable CONFIG_ACPI_APEI --disable CONFIG_ACPI_APD --disable CONFIG_ACPI_LPSS --disable CONFIG_ACPI_PCI_SLOT --disable CONFIG_ACPI_PCI_ROOT \
+              --disable CONFIG_IPV6 --disable CONFIG_BRIDGE --disable CONFIG_VLAN_8021Q --disable CONFIG_BT --disable CONFIG_NET_9P --disable CONFIG_9P_FS \
+              --disable CONFIG_COMMON_CLK_BCM --disable CONFIG_CLK_BCM_IPROC --disable CONFIG_CLK_BCM2835 \
+              --disable CONFIG_ACPI --disable CONFIG_ACPI_EC --disable CONFIG_ACPI_LPSS --disable CONFIG_ACPI_APEI --disable CONFIG_ACPI_APD --disable CONFIG_ACPI_PCI_SLOT --disable CONFIG_ACPI_PCI_ROOT \
               --disable CONFIG_COMPILE_TEST \
               --set-str CONFIG_LOCALVERSION "" --enable CONFIG_LOCALVERSION_AUTO \
               --enable CONFIG_KERNEL_GZIP \
               --disable CONFIG_KERNEL_BZIP2 --disable CONFIG_KERNEL_LZMA --disable CONFIG_KERNEL_XZ --disable CONFIG_KERNEL_LZO --disable CONFIG_KERNEL_LZ4 || true
           fi
 
-          # Sed fallback to ensure nothing slips through
-          sed -i 's/^CONFIG_BTRFS_FS=m/CONFIG_BTRFS_FS=n/' out/.config
-          for s in CONFIG_BTRFS_FS_POSIX_ACL CONFIG_TASKSTATS CONFIG_TASK_DELAY_ACCT CONFIG_TASK_XACCT CONFIG_TASK_IO_ACCOUNTING \
+          # Sed fallback to ensure enforcement
+          for s in CONFIG_BTRFS_FS CONFIG_BTRFS_FS_POSIX_ACL CONFIG_TASKSTATS CONFIG_TASK_DELAY_ACCT CONFIG_TASK_XACCT CONFIG_TASK_IO_ACCOUNTING \
                    CONFIG_NFS_FS CONFIG_NFS_V4 CONFIG_LOCKD CONFIG_SUNRPC \
                    CONFIG_HUGETLB_PAGE CONFIG_HUGETLBFS CONFIG_TRANSPARENT_HUGEPAGE CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS CONFIG_TRANSPARENT_HUGEPAGE_MADVISE CONFIG_KSM \
-                   CONFIG_ACPI CONFIG_ACPI_APEI CONFIG_ACPI_APD CONFIG_ACPI_LPSS CONFIG_ACPI_PCI_SLOT CONFIG_ACPI_PCI_ROOT CONFIG_COMPILE_TEST; do
+                   CONFIG_IPV6 CONFIG_BRIDGE CONFIG_VLAN_8021Q CONFIG_BT CONFIG_NET_9P CONFIG_9P_FS \
+                   CONFIG_COMMON_CLK_BCM CONFIG_CLK_BCM_IPROC CONFIG_CLK_BCM2835 \
+                   CONFIG_ACPI CONFIG_ACPI_EC CONFIG_ACPI_LPSS CONFIG_ACPI_APEI CONFIG_ACPI_APD CONFIG_ACPI_PCI_SLOT CONFIG_ACPI_PCI_ROOT \
+                   CONFIG_COMPILE_TEST; do
             sed -i "s/^${s}=.*/${s}=n/" out/.config
           done
           sed -i 's/^# CONFIG_NR_CPUS is not set$/CONFIG_NR_CPUS=8/' out/.config
@@ -221,13 +261,13 @@ jobs:
             sed -i 's/^CONFIG_CROSS_COMPILE=.*/CONFIG_CROSS_COMPILE="aarch64-linux-gnu-"/' out/.config
           fi
 
-          # Re-resolve dependencies and write auto.conf
+          # Re-resolve deps and write auto.conf
           make O=out ARCH=arm64 olddefconfig
 
-          echo "==== Key config lines ===="
-          egrep -E '^(CONFIG_ACPI|CONFIG_NR_CPUS|CONFIG_HUGETLB_PAGE|CONFIG_TRANSPARENT_HUGEPAGE|CONFIG_BTRFS_FS|CONFIG_TASKSTATS|CONFIG_NFS_FS|CONFIG_KERNEL_GZIP)=' out/.config || true
+          echo "==== Debug: enabled bits that should be off (if any) ===="
+          egrep -E '^(CONFIG_IPV6|CONFIG_BRIDGE|CONFIG_VLAN_8021Q|CONFIG_BT|CONFIG_COMMON_CLK_BCM|CONFIG_ACPI|CONFIG_NFS|CONFIG_BTRFS|CONFIG_TASKSTATS)=[my]' out/.config || echo "All critical toggles disabled."
 
-      # 3) After finalize, build scripts/headers
+      # 3) Prepare scripts and headers
       - name: Prepare scripts and headers
         working-directory: ./kernel
         run: |
@@ -250,17 +290,12 @@ jobs:
           export HOSTCC=clang-18
           export HOSTCXX=clang++-18
 
-          # Final non-interactive settle
           make O=out ARCH=arm64 olddefconfig
 
-          # Verify critical toggles (fail fast if vendor flipped anything back)
-          if ! grep -q '^CONFIG_NR_CPUS=8' out/.config; then
-            echo "Error: NR_CPUS not set to 8"; exit 1
-          fi
-          for s in CONFIG_BTRFS_FS CONFIG_TASKSTATS CONFIG_TRANSPARENT_HUGEPAGE CONFIG_NFS_FS CONFIG_ACPI; do
-            if grep -q "^${s}=[my]" out/.config; then
-              echo "Error: ${s} still enabled"; exit 1
-            fi
+          # Verify critical toggles before compile
+          if ! grep -q '^CONFIG_NR_CPUS=8' out/.config; then echo "Error: NR_CPUS not 8"; exit 1; fi
+          for s in CONFIG_IPV6 CONFIG_BRIDGE CONFIG_VLAN_8021Q CONFIG_BT CONFIG_COMMON_CLK_BCM CONFIG_ACPI CONFIG_NFS_FS CONFIG_BTRFS_FS CONFIG_TASKSTATS; do
+            if grep -q "^${s}=[my]" out/.config; then echo "Error: ${s} still enabled"; exit 1; fi
           done
 
           make ${KERNEL_CMDLINE} CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j"$(nproc)"
