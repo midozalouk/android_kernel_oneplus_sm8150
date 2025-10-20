@@ -99,7 +99,6 @@ jobs:
             sed -i '/pte_t \*pte = NULL;/a \  pte_t *ptep = NULL;' arch/arm64/mm/hugetlbpage.c || true
           fi
           sed -i 's/ptep = huge_pmd_share(mm, vma, addr, pud);/if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);/' arch/arm64/mm/hugetlbpage.c || true
-          grep -n 'ptep' arch/arm64/mm/hugetlbpage.c || true
 
       # Patch B: mm/huge_memory.c try_to_unmap signature shim (add NULL 3rd arg)
       - name: Apply huge_memory try_to_unmap signature patch
@@ -108,35 +107,19 @@ jobs:
           set -euo pipefail
           sed -i 's/try_to_unmap(page, ttu_flags);/try_to_unmap(page, ttu_flags, NULL);/g' mm/huge_memory.c || true
 
-      # Patch C: fs/proc/task_mmu.c fix split_huge_pmd arg order; use extended regex for whitespace
+      # Patch C: fs/proc/task_mmu.c fix split_huge_pmd arg order (vma, addr, pmd) -> (vma, pmd, addr)
       - name: Fix split_huge_pmd call order
         working-directory: kernel
         run: |
           set -euo pipefail
-          sed -Ei 's/split_huge_pmd\(([[:space:]]*)vma([[:space:]]*),([[:space:]]*)addr([[:space:]]*),([[:space:]]*)pmd([[:space:]]*)\);/split_huge_pmd(vma, pmd, addr);/' fs/proc/task_mmu.c || true
-          grep -n 'split_huge_pmd' fs/proc/task_mmu.c || true
+          sed -Ei 's/split_huge_pmd\(([[:space:]]*)vma([[:space:]]*),([[:space:]]*)addr([[:space:]]*),([[:space:]]*)pmd([[:space:]]*)\);/split_huge_pmd(vma, pmd, addr);/g' fs/proc/task_mmu.c || true
 
-      # Patch D: mm/khugepaged.c remove obsolete mm->nr_ptes usage to avoid API skew build break
+      # Patch D: mm/khugepaged.c remove obsolete mm->nr_ptes usage (neutralize line to avoid API skew)
       - name: Neutralize mm->nr_ptes in khugepaged
         working-directory: kernel
         run: |
           set -euo pipefail
           sed -i 's/atomic_long_dec(&mm->nr_ptes);/\/\* compat: mm->nr_ptes removed in this tree \*\/ do {} while (0);/' mm/khugepaged.c || true
-          grep -n 'nr_ptes' mm/khugepaged.c || true
-
-      # Patch E: Filter out NFS/LOCKD/SUNRPC dirs at the make level, in case vendor fragments re-enable them
-        # This ensures they won’t be built even if .config flips unexpectedly.
-      - name: Filter NFS/LOCKD/SUNRPC subdirs from fs/Makefile
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-          {
-            echo ''
-            echo '# CI filter: prevent NFS/LOCKD/SUNRPC from building regardless of Kconfig'
-            echo 'subdir-y := $(filter-out nfs lockd nfs_common sunrpc,$(subdir-y))'
-            echo 'subdir-m := $(filter-out nfs lockd nfs_common sunrpc,$(subdir-m))'
-          } >> fs/Makefile
-          tail -n 6 fs/Makefile || true
 
       # 1) Seed .config into O=out
       - name: Prepare kernel output directory (defconfig)
@@ -149,21 +132,25 @@ jobs:
           mkdir -p out
           make O=out ARCH=arm64 ${KERNEL_DEFCONFIG}
 
-      # 2) Non-interactive finalize + hard enforcement to avoid prompts and API skews
+      # 2) Non-interactive finalize + hard enforcement (disable ACPI/THP/KSM/BTRFS/TASKSTATS/NFS; NR_CPUS=8; gzip)
       - name: Finalize kernel config (non-interactive + enforce)
         working-directory: kernel
         run: |
           set -euo pipefail
           export PATH=/usr/lib/llvm-18/bin:$PATH
+
+          # Preseed all critical toggles to avoid Kconfig prompts and API skews
           cat > ../ci.defaults <<'EOF'
           CONFIG_QTI_GVM=n
           CONFIG_NR_CPUS=8
+          # MM/hugepage opt-outs
           CONFIG_HUGETLB_PAGE=n
           CONFIG_HUGETLBFS=n
           CONFIG_TRANSPARENT_HUGEPAGE=n
           CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS=n
           CONFIG_TRANSPARENT_HUGEPAGE_MADVISE=n
           CONFIG_KSM=n
+          # Filesystems we don't need on Android
           CONFIG_BTRFS_FS=n
           CONFIG_BTRFS_FS_POSIX_ACL=n
           CONFIG_TASKSTATS=n
@@ -174,6 +161,14 @@ jobs:
           CONFIG_NFS_V4=n
           CONFIG_LOCKD=n
           CONFIG_SUNRPC=n
+          # ACPI should be off on DT-based Android devices (sm8150)
+          CONFIG_ACPI=n
+          CONFIG_ACPI_APEI=n
+          CONFIG_ACPI_APD=n
+          CONFIG_ACPI_LPSS=n
+          CONFIG_ACPI_PCI_SLOT=n
+          CONFIG_ACPI_PCI_ROOT=n
+          # General setup/prevent prompts
           CONFIG_COMPILE_TEST=n
           CONFIG_LOCALVERSION=""
           CONFIG_LOCALVERSION_AUTO=y
@@ -185,27 +180,33 @@ jobs:
           CONFIG_KERNEL_LZ4=n
           CONFIG_CROSS_COMPILE="aarch64-linux-gnu-"
           EOF
+
+          # Resolve all new symbols non-interactively
           make O=out ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../ci.defaults
 
+          # Enforce again (handle vendor flips); scripts/config if present, sed fallback otherwise
           if [ -x scripts/config ]; then
             ./scripts/config --file out/.config \
-              --disable CONFIG_QTI_GVM \
-              --set-val CONFIG_NR_CPUS 8 \
+              --disable CONFIG_QTI_GVM --set-val CONFIG_NR_CPUS 8 \
               --disable CONFIG_HUGETLB_PAGE --disable CONFIG_HUGETLBFS \
               --disable CONFIG_TRANSPARENT_HUGEPAGE --disable CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS --disable CONFIG_TRANSPARENT_HUGEPAGE_MADVISE \
               --disable CONFIG_KSM \
               --disable CONFIG_BTRFS_FS --disable CONFIG_BTRFS_FS_POSIX_ACL \
               --disable CONFIG_TASKSTATS --disable CONFIG_TASK_DELAY_ACCT --disable CONFIG_TASK_XACCT --disable CONFIG_TASK_IO_ACCOUNTING \
               --disable CONFIG_NFS_FS --disable CONFIG_NFS_V4 --disable CONFIG_LOCKD --disable CONFIG_SUNRPC \
+              --disable CONFIG_ACPI --disable CONFIG_ACPI_APEI --disable CONFIG_ACPI_APD --disable CONFIG_ACPI_LPSS --disable CONFIG_ACPI_PCI_SLOT --disable CONFIG_ACPI_PCI_ROOT \
               --disable CONFIG_COMPILE_TEST \
               --set-str CONFIG_LOCALVERSION "" --enable CONFIG_LOCALVERSION_AUTO \
               --enable CONFIG_KERNEL_GZIP \
               --disable CONFIG_KERNEL_BZIP2 --disable CONFIG_KERNEL_LZMA --disable CONFIG_KERNEL_XZ --disable CONFIG_KERNEL_LZO --disable CONFIG_KERNEL_LZ4 || true
           fi
 
-          # Sed fallback to ensure enforcement
+          # Sed fallback to ensure nothing slips through
           sed -i 's/^CONFIG_BTRFS_FS=m/CONFIG_BTRFS_FS=n/' out/.config
-          for s in CONFIG_BTRFS_FS_POSIX_ACL CONFIG_TASKSTATS CONFIG_TASK_DELAY_ACCT CONFIG_TASK_XACCT CONFIG_TASK_IO_ACCOUNTING CONFIG_NFS_FS CONFIG_NFS_V4 CONFIG_LOCKD CONFIG_SUNRPC CONFIG_HUGETLB_PAGE CONFIG_HUGETLBFS CONFIG_TRANSPARENT_HUGEPAGE CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS CONFIG_TRANSPARENT_HUGEPAGE_MADVISE CONFIG_KSM CONFIG_COMPILE_TEST; do
+          for s in CONFIG_BTRFS_FS_POSIX_ACL CONFIG_TASKSTATS CONFIG_TASK_DELAY_ACCT CONFIG_TASK_XACCT CONFIG_TASK_IO_ACCOUNTING \
+                   CONFIG_NFS_FS CONFIG_NFS_V4 CONFIG_LOCKD CONFIG_SUNRPC \
+                   CONFIG_HUGETLB_PAGE CONFIG_HUGETLBFS CONFIG_TRANSPARENT_HUGEPAGE CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS CONFIG_TRANSPARENT_HUGEPAGE_MADVISE CONFIG_KSM \
+                   CONFIG_ACPI CONFIG_ACPI_APEI CONFIG_ACPI_APD CONFIG_ACPI_LPSS CONFIG_ACPI_PCI_SLOT CONFIG_ACPI_PCI_ROOT CONFIG_COMPILE_TEST; do
             sed -i "s/^${s}=.*/${s}=n/" out/.config
           done
           sed -i 's/^# CONFIG_NR_CPUS is not set$/CONFIG_NR_CPUS=8/' out/.config
@@ -220,11 +221,11 @@ jobs:
             sed -i 's/^CONFIG_CROSS_COMPILE=.*/CONFIG_CROSS_COMPILE="aarch64-linux-gnu-"/' out/.config
           fi
 
-          # Re-resolve deps and write auto.conf
+          # Re-resolve dependencies and write auto.conf
           make O=out ARCH=arm64 olddefconfig
 
           echo "==== Key config lines ===="
-          egrep -E '^(CONFIG_QTI_GVM|CONFIG_NR_CPUS|CONFIG_HUGETLB_PAGE|CONFIG_TRANSPARENT_HUGEPAGE|CONFIG_BTRFS_FS|CONFIG_TASKSTATS|CONFIG_NFS_FS|CONFIG_KERNEL_GZIP)=' out/.config || true
+          egrep -E '^(CONFIG_ACPI|CONFIG_NR_CPUS|CONFIG_HUGETLB_PAGE|CONFIG_TRANSPARENT_HUGEPAGE|CONFIG_BTRFS_FS|CONFIG_TASKSTATS|CONFIG_NFS_FS|CONFIG_KERNEL_GZIP)=' out/.config || true
 
       # 3) After finalize, build scripts/headers
       - name: Prepare scripts and headers
@@ -249,18 +250,16 @@ jobs:
           export HOSTCC=clang-18
           export HOSTCXX=clang++-18
 
-          # Final safety olddefconfig
+          # Final non-interactive settle
           make O=out ARCH=arm64 olddefconfig
 
-          # Verify critical toggles
+          # Verify critical toggles (fail fast if vendor flipped anything back)
           if ! grep -q '^CONFIG_NR_CPUS=8' out/.config; then
-            echo "Error: NR_CPUS not set to 8"
-            exit 1
+            echo "Error: NR_CPUS not set to 8"; exit 1
           fi
-          for s in CONFIG_BTRFS_FS CONFIG_TASKSTATS CONFIG_TRANSPARENT_HUGEPAGE CONFIG_NFS_FS; do
+          for s in CONFIG_BTRFS_FS CONFIG_TASKSTATS CONFIG_TRANSPARENT_HUGEPAGE CONFIG_NFS_FS CONFIG_ACPI; do
             if grep -q "^${s}=[my]" out/.config; then
-              echo "Error: ${s} still enabled"
-              exit 1
+              echo "Error: ${s} still enabled"; exit 1
             fi
           done
 
