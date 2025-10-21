@@ -95,7 +95,7 @@ jobs:
           export PATH="/usr/lib/llvm-18/bin:$PATH"
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
 
-      # ===== MM skew patches =====
+      # MM fixes for hugetlb/THP
       - name: Apply hugetlbpage fix patch
         working-directory: kernel
         run: |
@@ -103,9 +103,9 @@ jobs:
           if ! grep -q 'pte_t \*ptep' arch/arm64/mm/hugetlbpage.c; then
             sed -i '/pte_t \*pte = NULL;/a \  pte_t *ptep = NULL;' arch/arm64/mm/hugetlbpage.c || true
           fi
-          sed -i 's/ptep = huge_pmd_share(mm, vma, addr, pud);/if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);/' arch/arm64/mm/hugetlbpage.c || true
+          sed -i 's/ptep = huge_pmd_share(mm, vma, addr, pud);/if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);/' arch/arm64/mm/hugetlbpage.c
 
-      - name: Apply huge_memory try_to_unmap signature patch
+      - name: Apply huge_memory try_to_unmap shim
         working-directory: kernel
         run: |
           set -euo pipefail
@@ -124,7 +124,7 @@ jobs:
           set -euo pipefail
           sed -i 's/atomic_long_dec(&mm->nr_ptes);/\/\* compat: mm->nr_ptes removed \*\/ do {} while (0);/' mm/khugepaged.c || true
 
-      # ===== Kbuild blackholes (stop compilation regardless of Kconfig) =====
+      # Blackhole unwanted Kbuild and Makefile in important directories
       - name: Hard-blackhole unwanted Kbuild subtrees (CLK and NET)
         working-directory: kernel
         run: |
@@ -132,18 +132,22 @@ jobs:
           disable_dir() {
             local d="$1"
             if [ -d "$d" ]; then
-              [ -f "$d/Makefile" ] && mv -f "$d/Makefile" "$d/Makefile.bak" || true
-              [ -f "$d/Kbuild" ] && mv -f "$d/Kbuild" "$d/Kbuild.bak" || true
-              printf '# disabled in CI for sm8150\nobj-y :=\nobj-m :=\n' > "$d/Makefile"
-              printf '# disabled in CI for sm8150\n' > "$d/Kbuild"
+              if [ -f "$d/Makefile" ]; then
+                mv -f "$d/Makefile" "$d/Makefile.bak" || true
+              fi
+              if [ -f "$d/Kbuild" ]; then
+                mv -f "$d/Kbuild" "$d/Kbuild.bak" || true
+              fi
+              echo -e '# disabled in CI for sm8150\nobj-y :=\nobj-m :=' > "$d/Makefile"
+              chmod 644 "$d/Makefile"
               echo "[CI] Blackholed $d"
+            else
+              echo "[CI WARNING] Directory $d not found"
             fi
           }
-          # Clocks vendors causing provider API errors
           disable_dir drivers/clk/bcm
           disable_dir drivers/clk/berlin
           disable_dir drivers/clk/hisilicon
-          # Networking families that drag IPv6/seg6/BPF/mac80211 stacks
           disable_dir net/ipv6
           disable_dir net/bridge
           disable_dir net/8021q
@@ -166,7 +170,7 @@ jobs:
             sed -i 's|#include <net/seg6.h>|#if IS_ENABLED(CONFIG_IPV6_SEG6_BPF)\n#include <net/seg6.h>\n#endif|' net/core/filter.c
           fi
 
-      # ===== fs Makefile filter for NFS stacks =====
+      # Filter NFS/LOCKD/SUNRPC from fs
       - name: Filter NFS/LOCKD/SUNRPC from fs/Makefile
         working-directory: kernel
         run: |
@@ -180,7 +184,7 @@ jobs:
             } >> fs/Makefile
           fi
 
-      # ===== ACPI subtree filter on DT/arm64 =====
+      # Filter ACPI dir from drivers/Makefile
       - name: Filter ACPI dir from drivers/Makefile
         working-directory: kernel
         run: |
@@ -194,7 +198,7 @@ jobs:
             } >> drivers/Makefile
           fi
 
-      # ===== 1) defconfig =====
+      # Prepare defconfig
       - name: Prepare kernel output directory (defconfig)
         working-directory: kernel
         run: |
@@ -205,7 +209,7 @@ jobs:
           mkdir -p out
           make O=out ARCH=arm64 ${KERNEL_DEFCONFIG}
 
-      # ===== 2) Non-interactive finalize + hard enforcement =====
+      # Non-interactive config finalize and enforcement
       - name: Finalize kernel config (non-interactive + enforce)
         working-directory: kernel
         run: |
@@ -214,14 +218,12 @@ jobs:
           cat > ../ci.defaults <<'EOF'
           CONFIG_QTI_GVM=n
           CONFIG_NR_CPUS=8
-          # MM/hugepage off
           CONFIG_HUGETLB_PAGE=n
           CONFIG_HUGETLBFS=n
           CONFIG_TRANSPARENT_HUGEPAGE=n
           CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS=n
           CONFIG_TRANSPARENT_HUGEPAGE_MADVISE=n
           CONFIG_KSM=n
-          # FS / stats off
           CONFIG_BTRFS_FS=n
           CONFIG_BTRFS_FS_POSIX_ACL=n
           CONFIG_TASKSTATS=n
@@ -232,7 +234,6 @@ jobs:
           CONFIG_NFS_V4=n
           CONFIG_LOCKD=n
           CONFIG_SUNRPC=n
-          # Networking trims (avoid IPv6/seg6/BPF/mac80211/netfilter)
           CONFIG_IPV6=n
           CONFIG_IPV6_SEG6_LWTUNNEL=n
           CONFIG_IPV6_SEG6_BPF=n
@@ -249,14 +250,12 @@ jobs:
           CONFIG_VLAN_8021Q=n
           CONFIG_NET_9P=n
           CONFIG_9P_FS=n
-          # Vendor clocks off
           CONFIG_COMMON_CLK_BCM=n
           CONFIG_CLK_BCM_IPROC=n
           CONFIG_CLK_BCM2835=n
           CONFIG_COMMON_CLK_HI3660=n
           CONFIG_COMMON_CLK_HI3670=n
           CONFIG_COMMON_CLK_HI6220=n
-          # ACPI off
           CONFIG_ACPI=n
           CONFIG_ACPI_EC=n
           CONFIG_ACPI_LPSS=n
@@ -264,11 +263,9 @@ jobs:
           CONFIG_ACPI_APD=n
           CONFIG_ACPI_PCI_SLOT=n
           CONFIG_ACPI_PCI_ROOT=n
-          # PCI extras off
           CONFIG_PCI_QUIRKS=n
           CONFIG_PCIEAER=n
           CONFIG_PCIEPORTBUS=n
-          # Non-interactive defaults
           CONFIG_COMPILE_TEST=n
           CONFIG_LOCALVERSION=""
           CONFIG_LOCALVERSION_AUTO=y
@@ -308,7 +305,6 @@ jobs:
               --disable CONFIG_KERNEL_BZIP2 --disable CONFIG_KERNEL_LZMA --disable CONFIG_KERNEL_XZ --disable CONFIG_KERNEL_LZO --disable CONFIG_KERNEL_LZ4 || true
           fi
 
-          # Sed fallback
           for s in CONFIG_BTRFS_FS CONFIG_BTRFS_FS_POSIX_ACL CONFIG_TASKSTATS CONFIG_TASK_DELAY_ACCT CONFIG_TASK_XACCT CONFIG_TASK_IO_ACCOUNTING \
                    CONFIG_NFS_FS CONFIG_NFS_V4 CONFIG_LOCKD CONFIG_SUNRPC \
                    CONFIG_HUGETLB_PAGE CONFIG_HUGETLBFS CONFIG_TRANSPARENT_HUGEPAGE CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS CONFIG_TRANSPARENT_HUGEPAGE_MADVISE CONFIG_KSM \
@@ -338,7 +334,6 @@ jobs:
           echo "==== Snapshot of critical toggles ===="
           egrep -E '^(CONFIG_NR_CPUS|CONFIG_IPV6|CONFIG_IPV6_SEG6_BPF|CONFIG_BPF_SYSCALL|CONFIG_NETFILTER|CONFIG_MAC80211|CONFIG_COMMON_CLK_BCM|CONFIG_COMMON_CLK_HI|CONFIG_ACPI|CONFIG_NFS|CONFIG_BTRFS|CONFIG_TASKSTATS|CONFIG_HUGETLB_PAGE|CONFIG_TRANSPARENT_HUGEPAGE|CONFIG_KERNEL_GZIP)=' out/.config || true
 
-      # ===== scripts/headers =====
       - name: Prepare scripts and headers
         working-directory: kernel
         run: |
@@ -349,24 +344,30 @@ jobs:
           make ${KERNEL_CMDLINE} scripts CC="ccache clang-18"
           make ${KERNEL_CMDLINE} prepare CC="ccache clang-18"
 
-      # ===== final verify + build =====
       - name: Verify critical toggles and blackholes
         working-directory: kernel
         run: |
           set -euo pipefail
-          if ! grep -q '^CONFIG_NR_CPUS=8' out/.config; then echo "Error: NR_CPUS not 8"; exit 1; fi
+          if ! grep -q '^CONFIG_NR_CPUS=8' out/.config; then
+            echo "Error: NR_CPUS not 8"
+            exit 1
+          fi
           for s in CONFIG_IPV6 CONFIG_IPV6_SEG6_LWTUNNEL CONFIG_IPV6_SEG6_BPF CONFIG_BPF_SYSCALL CONFIG_BPF_JIT \
                    CONFIG_NETFILTER CONFIG_NETFILTER_ADVANCED CONFIG_NETFILTER_XTABLES CONFIG_XDP_SOCKETS CONFIG_NET_CLS_BPF CONFIG_NET_ACT_BPF \
                    CONFIG_MAC80211 CONFIG_BT CONFIG_VLAN_8021Q CONFIG_NET_9P CONFIG_9P_FS \
                    CONFIG_COMMON_CLK_BCM CONFIG_CLK_BCM_IPROC CONFIG_CLK_BCM2835 CONFIG_COMMON_CLK_HI3660 CONFIG_COMMON_CLK_HI3670 CONFIG_COMMON_CLK_HI6220 \
                    CONFIG_ACPI CONFIG_NFS_FS CONFIG_BTRFS_FS CONFIG_TASKSTATS CONFIG_HUGETLB_PAGE CONFIG_TRANSPARENT_HUGEPAGE; do
-            if grep -q "^${s}=[my]" out/.config; then echo "Error: ${s} still enabled"; exit 1; fi
+            if grep -q "^${s}=[my]" out/.config; then
+              echo "Error: ${s} still enabled"
+              exit 1
+            fi
           done
-          # Ensure blackholes took effect (Makefile exists and is emptied)
+
           for d in drivers/clk/hisilicon drivers/clk/bcm drivers/clk/berlin net/ipv6 net/bridge net/8021q net/bluetooth net/9p net/netfilter net/mac80211 net/llc; do
             if [ -d "$d" ]; then
               if [ -f "$d/Makefile" ] && [ -s "$d/Makefile" ]; then
-                echo "Error: $d Makefile not blackholed"; exit 1
+                echo "Error: $d Makefile not blackholed"
+                exit 1
               fi
             fi
           done
@@ -384,7 +385,7 @@ jobs:
           export HOSTCXX="clang++-18"
 
           make O=out ARCH=arm64 olddefconfig
-          make ${KERNEL_CMDLINE} CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j"$(nproc)"
+          make ${KERNEL_CMDLINE} CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j$(nproc)
           test -f out/arch/arm64/boot/Image
           cp out/arch/arm64/boot/Image ../AnyKernel3
 
@@ -400,7 +401,7 @@ jobs:
           make ${KERNEL_CMDLINE} modules_prepare CC="ccache clang-18"
           make ${KERNEL_CMDLINE} CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" \
             OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" \
-            -j"$(nproc)" M=drivers/staging/qcacld-3.0 modules
+            -j$(nproc) M=drivers/staging/qcacld-3.0 modules
 
           sudo mkdir -p ../modules/vendor/lib/modules
           sudo find out/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \;
