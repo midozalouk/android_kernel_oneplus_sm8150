@@ -90,7 +90,7 @@ jobs:
           export PATH=/usr/lib/llvm-18/bin:$PATH
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
 
-      # Patch A: arch/arm64/mm/hugetlbpage.c (declare ptep, guard huge_pmd_share) - pattern-based, idempotent
+      # MM patches to avoid hugetlb/THP API skews
       - name: Apply hugetlbpage fix patch
         working-directory: kernel
         run: |
@@ -100,29 +100,26 @@ jobs:
           fi
           sed -i 's/ptep = huge_pmd_share(mm, vma, addr, pud);/if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);/' arch/arm64/mm/hugetlbpage.c || true
 
-      # Patch B: mm/huge_memory.c try_to_unmap signature shim (add NULL 3rd arg)
       - name: Apply huge_memory try_to_unmap signature patch
         working-directory: kernel
         run: |
           set -euo pipefail
-          sed -i 's/try_to_unmap(page, ttu_flags);/try_to_unmap(page, ttu_flags, NULL);/g' mm/hugetlb.c mm/huge_memory.c 2>/dev/null || true
-          sed -i 's/try_to_unmap(\s*page\s*,\s*ttu_flags\s*)/try_to_unmap(page, ttu_flags, NULL)/g' mm/hugetlb.c mm/huge_memory.c 2>/dev/null || true
+          sed -i 's/try_to_unmap(page, ttu_flags);/try_to_unmap(page, ttu_flags, NULL);/g' mm/huge_memory.c 2>/dev/null || true
+          sed -i 's/try_to_unmap(\s*page\s*,\s*ttu_flags\s*)/try_to_unmap(page, ttu_flags, NULL)/g' mm/huge_memory.c 2>/dev/null || true
 
-      # Patch C: fs/proc/task_mmu.c fix split_huge_pmd arg order
       - name: Fix split_huge_pmd call order
         working-directory: kernel
         run: |
           set -euo pipefail
           sed -Ei 's/split_huge_pmd\(([[:space:]]*)vma([[:space:]]*),([[:space:]]*)addr([[:space:]]*),([[:space:]]*)pmd([[:space:]]*)\);/split_huge_pmd(vma, pmd, addr);/g' fs/proc/task_mmu.c || true
 
-      # Patch D: mm/khugepaged.c neutralize obsolete mm->nr_ptes usage
       - name: Neutralize mm->nr_ptes in khugepaged
         working-directory: kernel
         run: |
           set -euo pipefail
           sed -i 's/atomic_long_dec(&mm->nr_ptes);/\/\* compat: mm->nr_ptes removed \*\/ do {} while (0);/' mm/khugepaged.c || true
 
-      # Filter NFS/LOCKD/SUNRPC dirs from fs to avoid accidental builds
+      # Filter out FS and CLK subtrees that must not build on this target
       - name: Filter NFS/LOCKD/SUNRPC from fs/Makefile
         working-directory: kernel
         run: |
@@ -136,32 +133,31 @@ jobs:
             } >> fs/Makefile
           fi
 
-      # Filter Broadcom clock subtree so BCM PLL never builds
-      - name: Filter BCM clock directory from drivers/clk/Makefile
+      - name: Filter BCM and Berlin clock directories from drivers/clk/Makefile
         working-directory: kernel
         run: |
           set -euo pipefail
-          if ! grep -q 'CI filter: disable bcm clocks' drivers/clk/Makefile; then
+          if ! grep -q 'CI filter: disable bcm/berlin clocks' drivers/clk/Makefile; then
             {
               echo ''
-              echo '# CI filter: disable bcm clocks on sm8150'
-              echo 'subdir-y := $(filter-out bcm,$(subdir-y))'
-              echo 'subdir-m := $(filter-out bcm,$(subdir-m))'
+              echo '# CI filter: disable bcm/berlin clocks on sm8150'
+              echo 'subdir-y := $(filter-out bcm berlin,$(subdir-y))'
+              echo 'subdir-m := $(filter-out bcm berlin,$(subdir-m))'
               echo '# end CI filter'
             } >> drivers/clk/Makefile
           fi
-          # No-op the BCM Makefile to be extra safe
-          if [ -f drivers/clk/bcm/Makefile ]; then
-            mv -f drivers/clk/bcm/Makefile drivers/clk/bcm/Makefile.bak || true
-            printf '# disabled in CI for sm8150\nobj-y :=\nobj-m :=\n' > drivers/clk/bcm/Makefile
-          fi
-          # Optional: no-op RPi audio if present
+          for d in drivers/clk/bcm drivers/clk/berlin; do
+            if [ -f "$d/Makefile" ]; then
+              mv -f "$d/Makefile" "$d/Makefile.bak" || true
+              printf '# disabled in CI for sm8150\nobj-y :=\nobj-m :=\n' > "$d/Makefile"
+            fi
+          done
+          # Optional: ensure RPi SoC audio path is no-op if present
           if [ -f sound/soc/bcm/Makefile ]; then
             mv -f sound/soc/bcm/Makefile sound/soc/bcm/Makefile.bak || true
             printf '# disabled in CI for sm8150\nobj-y :=\nobj-m :=\n' > sound/soc/bcm/Makefile
           fi
 
-      # Optional: Filter ACPI dir to avoid accidental builds on DT/arm64
       - name: Filter ACPI dir from drivers/Makefile
         working-directory: kernel
         run: |
@@ -186,25 +182,24 @@ jobs:
           mkdir -p out
           make O=out ARCH=arm64 ${KERNEL_DEFCONFIG}
 
-      # 2) Non-interactive finalize + aggressive enforcement to avoid prompts and API skews
+      # 2) Non-interactive finalize + aggressive enforcement (net/BPF/clk/ACPI trimmed)
       - name: Finalize kernel config (non-interactive + enforce)
         working-directory: kernel
         run: |
           set -euo pipefail
           export PATH=/usr/lib/llvm-18/bin:$PATH
 
-          # Preseed defaults (non-interactive) and disable problematic subsystems
           cat > ../ci.defaults <<'EOF'
           CONFIG_QTI_GVM=n
           CONFIG_NR_CPUS=8
-          # MM/hugepage options off
+          # MM/hugepage off
           CONFIG_HUGETLB_PAGE=n
           CONFIG_HUGETLBFS=n
           CONFIG_TRANSPARENT_HUGEPAGE=n
           CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS=n
           CONFIG_TRANSPARENT_HUGEPAGE_MADVISE=n
           CONFIG_KSM=n
-          # Filesystems/features not needed or broken on this tree
+          # FS/metrics off
           CONFIG_BTRFS_FS=n
           CONFIG_BTRFS_FS_POSIX_ACL=n
           CONFIG_TASKSTATS=n
@@ -215,18 +210,24 @@ jobs:
           CONFIG_NFS_V4=n
           CONFIG_LOCKD=n
           CONFIG_SUNRPC=n
-          # Networking trims to avoid IPv6 ip6_fib issue and reduce surface
+          # Networking trims (avoid IPv6/seg6/BPF/mac80211)
           CONFIG_IPV6=n
-          CONFIG_BRIDGE=n
-          CONFIG_VLAN_8021Q=n
-          CONFIG_BT=n
-          CONFIG_NET_9P=n
-          CONFIG_9P_FS=n
-          # Broadcom clocks completely off
+          CONFIG_IPV6_SEG6_LWTUNNEL=n
+          CONFIG_IPV6_SEG6_BPF=n
+          CONFIG_BPF_SYSCALL=n
+          CONFIG_BPF_JIT=n
+          CONFIG_NETFILTER=n
+          CONFIG_NETFILTER_ADVANCED=n
+          CONFIG_NETFILTER_XTABLES=n
+          CONFIG_XDP_SOCKETS=n
+          CONFIG_NET_CLS_BPF=n
+          CONFIG_NET_ACT_BPF=n
+          CONFIG_MAC80211=n
+          # Broadcom/other clocks off
           CONFIG_COMMON_CLK_BCM=n
           CONFIG_CLK_BCM_IPROC=n
           CONFIG_CLK_BCM2835=n
-          # ACPI off (DT-based device)
+          # ACPI off
           CONFIG_ACPI=n
           CONFIG_ACPI_EC=n
           CONFIG_ACPI_LPSS=n
@@ -234,11 +235,11 @@ jobs:
           CONFIG_ACPI_APD=n
           CONFIG_ACPI_PCI_SLOT=n
           CONFIG_ACPI_PCI_ROOT=n
-          # PCI extras off (defensive)
+          # PCI extras off
           CONFIG_PCI_QUIRKS=n
           CONFIG_PCIEAER=n
           CONFIG_PCIEPORTBUS=n
-          # General setup / compression
+          # General non-interactive defaults
           CONFIG_COMPILE_TEST=n
           CONFIG_LOCALVERSION=""
           CONFIG_LOCALVERSION_AUTO=y
@@ -251,10 +252,9 @@ jobs:
           CONFIG_CROSS_COMPILE="aarch64-linux-gnu-"
           EOF
 
-          # Apply defaults and resolve without prompts
           make O=out ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../ci.defaults
 
-          # Hard-enforce critical toggles; if scripts/config missing, sed fallback will handle it
+          # scripts/config enforcement if present
           if [ -x scripts/config ]; then
             ./scripts/config --file out/.config \
               --disable CONFIG_QTI_GVM --set-val CONFIG_NR_CPUS 8 \
@@ -264,7 +264,11 @@ jobs:
               --disable CONFIG_BTRFS_FS --disable CONFIG_BTRFS_FS_POSIX_ACL \
               --disable CONFIG_TASKSTATS --disable CONFIG_TASK_DELAY_ACCT --disable CONFIG_TASK_XACCT --disable CONFIG_TASK_IO_ACCOUNTING \
               --disable CONFIG_NFS_FS --disable CONFIG_NFS_V4 --disable CONFIG_LOCKD --disable CONFIG_SUNRPC \
-              --disable CONFIG_IPV6 --disable CONFIG_BRIDGE --disable CONFIG_VLAN_8021Q --disable CONFIG_BT --disable CONFIG_NET_9P --disable CONFIG_9P_FS \
+              --disable CONFIG_IPV6 --disable CONFIG_IPV6_SEG6_LWTUNNEL --disable CONFIG_IPV6_SEG6_BPF \
+              --disable CONFIG_BPF_SYSCALL --disable CONFIG_BPF_JIT \
+              --disable CONFIG_NETFILTER --disable CONFIG_NETFILTER_ADVANCED --disable CONFIG_NETFILTER_XTABLES \
+              --disable CONFIG_XDP_SOCKETS --disable CONFIG_NET_CLS_BPF --disable CONFIG_NET_ACT_BPF \
+              --disable CONFIG_MAC80211 \
               --disable CONFIG_COMMON_CLK_BCM --disable CONFIG_CLK_BCM_IPROC --disable CONFIG_CLK_BCM2835 \
               --disable CONFIG_ACPI --disable CONFIG_ACPI_EC --disable CONFIG_ACPI_LPSS --disable CONFIG_ACPI_APEI --disable CONFIG_ACPI_APD --disable CONFIG_ACPI_PCI_SLOT --disable CONFIG_ACPI_PCI_ROOT \
               --disable CONFIG_PCI_QUIRKS --disable CONFIG_PCIEAER --disable CONFIG_PCIEPORTBUS \
@@ -278,7 +282,9 @@ jobs:
           for s in CONFIG_BTRFS_FS CONFIG_BTRFS_FS_POSIX_ACL CONFIG_TASKSTATS CONFIG_TASK_DELAY_ACCT CONFIG_TASK_XACCT CONFIG_TASK_IO_ACCOUNTING \
                    CONFIG_NFS_FS CONFIG_NFS_V4 CONFIG_LOCKD CONFIG_SUNRPC \
                    CONFIG_HUGETLB_PAGE CONFIG_HUGETLBFS CONFIG_TRANSPARENT_HUGEPAGE CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS CONFIG_TRANSPARENT_HUGEPAGE_MADVISE CONFIG_KSM \
-                   CONFIG_IPV6 CONFIG_BRIDGE CONFIG_VLAN_8021Q CONFIG_BT CONFIG_NET_9P CONFIG_9P_FS \
+                   CONFIG_IPV6 CONFIG_IPV6_SEG6_LWTUNNEL CONFIG_IPV6_SEG6_BPF \
+                   CONFIG_BPF_SYSCALL CONFIG_BPF_JIT CONFIG_NETFILTER CONFIG_NETFILTER_ADVANCED CONFIG_NETFILTER_XTABLES \
+                   CONFIG_XDP_SOCKETS CONFIG_NET_CLS_BPF CONFIG_NET_ACT_BPF CONFIG_MAC80211 \
                    CONFIG_COMMON_CLK_BCM CONFIG_CLK_BCM_IPROC CONFIG_CLK_BCM2835 \
                    CONFIG_ACPI CONFIG_ACPI_EC CONFIG_ACPI_LPSS CONFIG_ACPI_APEI CONFIG_ACPI_APD CONFIG_ACPI_PCI_SLOT CONFIG_ACPI_PCI_ROOT \
                    CONFIG_PCI_QUIRKS CONFIG_PCIEAER CONFIG_PCIEPORTBUS CONFIG_COMPILE_TEST; do
@@ -296,13 +302,13 @@ jobs:
             sed -i 's/^CONFIG_CROSS_COMPILE=.*/CONFIG_CROSS_COMPILE="aarch64-linux-gnu-"/' out/.config
           fi
 
-          # Re-resolve dependencies non-interactively
+          # Re-resolve deps and write auto.conf
           make O=out ARCH=arm64 olddefconfig
 
-          echo "==== Debug: critical toggles (should be off except NR_CPUS/Compression) ===="
-          egrep -E '^(CONFIG_NR_CPUS|CONFIG_IPV6|CONFIG_BRIDGE|CONFIG_VLAN_8021Q|CONFIG_BT|CONFIG_COMMON_CLK_BCM|CONFIG_ACPI|CONFIG_NFS|CONFIG_BTRFS|CONFIG_TASKSTATS|CONFIG_HUGETLB_PAGE|CONFIG_TRANSPARENT_HUGEPAGE|CONFIG_KERNEL_GZIP)=' out/.config || true
+          echo "==== Debug: critical toggles snapshot ===="
+          egrep -E '^(CONFIG_NR_CPUS|CONFIG_IPV6|CONFIG_IPV6_SEG6_BPF|CONFIG_BPF_SYSCALL|CONFIG_NETFILTER|CONFIG_MAC80211|CONFIG_COMMON_CLK_BCM|CONFIG_ACPI|CONFIG_NFS|CONFIG_BTRFS|CONFIG_TASKSTATS|CONFIG_HUGETLB_PAGE|CONFIG_TRANSPARENT_HUGEPAGE|CONFIG_KERNEL_GZIP)=' out/.config || true
 
-      # 3) After finalize, build scripts/headers
+      # 3) Build scripts and headers only after config settled
       - name: Prepare scripts and headers
         working-directory: ./kernel
         run: |
@@ -325,30 +331,21 @@ jobs:
           export HOSTCC=clang-18
           export HOSTCXX=clang++-18
 
-          # Final settle to avoid prompts
           make O=out ARCH=arm64 olddefconfig
 
-          # Verify critical toggles before compile (fail fast)
+          # Fail-fast verification of critical toggles
           if ! grep -q '^CONFIG_NR_CPUS=8' out/.config; then echo "Error: NR_CPUS not 8"; exit 1; fi
-          for s in CONFIG_IPV6 CONFIG_BRIDGE CONFIG_VLAN_8021Q CONFIG_BT CONFIG_COMMON_CLK_BCM CONFIG_CLK_BCM_IPROC CONFIG_CLK_BCM2835 CONFIG_ACPI CONFIG_NFS_FS CONFIG_BTRFS_FS CONFIG_TASKSTATS CONFIG_HUGETLB_PAGE CONFIG_TRANSPARENT_HUGEPAGE; do
+          for s in CONFIG_IPV6 CONFIG_IPV6_SEG6_LWTUNNEL CONFIG_IPV6_SEG6_BPF CONFIG_BPF_SYSCALL CONFIG_BPF_JIT \
+                   CONFIG_NETFILTER CONFIG_NETFILTER_ADVANCED CONFIG_NETFILTER_XTABLES CONFIG_XDP_SOCKETS CONFIG_NET_CLS_BPF CONFIG_NET_ACT_BPF \
+                   CONFIG_MAC80211 \
+                   CONFIG_COMMON_CLK_BCM CONFIG_CLK_BCM_IPROC CONFIG_CLK_BCM2835 \
+                   CONFIG_ACPI CONFIG_NFS_FS CONFIG_BTRFS_FS CONFIG_TASKSTATS CONFIG_HUGETLB_PAGE CONFIG_TRANSPARENT_HUGEPAGE; do
             if grep -q "^${s}=[my]" out/.config; then echo "Error: ${s} still enabled"; exit 1; fi
           done
 
           make ${KERNEL_CMDLINE} CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j"$(nproc)"
           test -f out/arch/arm64/boot/Image
           cp out/arch/arm64/boot/Image ../AnyKernel3
-
-      - name: Run simple verification on build output
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-          if [ -d out ]; then
-            echo "Build output exists:"
-            ls -lah out | sed -n '1,200p'
-          else
-            echo "No build output directory found"
-            exit 1
-          fi
 
       - name: Build Wi-Fi Module (qca_cld3)
         working-directory: ./kernel
