@@ -90,7 +90,7 @@ jobs:
           export PATH=/usr/lib/llvm-18/bin:$PATH
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
 
-      # MM patches to avoid hugetlb/THP API skews
+      # ===== MM skew patches =====
       - name: Apply hugetlbpage fix patch
         working-directory: kernel
         run: |
@@ -119,7 +119,50 @@ jobs:
           set -euo pipefail
           sed -i 's/atomic_long_dec(&mm->nr_ptes);/\/\* compat: mm->nr_ptes removed \*\/ do {} while (0);/' mm/khugepaged.c || true
 
-      # Filter out FS and CLK subtrees that must not build on this target
+      # ===== Kbuild blackholes (stop compilation regardless of Kconfig) =====
+      - name: Hard-blackhole unwanted Kbuild subtrees (CLK and NET)
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          disable_dir() {
+            local d="$1"
+            if [ -d "$d" ]; then
+              [ -f "$d/Makefile" ] && mv -f "$d/Makefile" "$d/Makefile.bak" || true
+              [ -f "$d/Kbuild" ] && mv -f "$d/Kbuild" "$d/Kbuild.bak" || true
+              printf '# disabled in CI for sm8150\nobj-y :=\nobj-m :=\n' > "$d/Makefile"
+              printf '# disabled in CI for sm8150\n' > "$d/Kbuild"
+              echo "[CI] Blackholed $d"
+            fi
+          }
+          # Clocks vendors causing provider API errors
+          disable_dir drivers/clk/bcm
+          disable_dir drivers/clk/berlin
+          disable_dir drivers/clk/hisilicon
+          # Networking families that drag IPv6/seg6/BPF/mac80211 stacks
+          disable_dir net/ipv6
+          disable_dir net/bridge
+          disable_dir net/8021q
+          disable_dir net/bluetooth
+          disable_dir net/9p
+          disable_dir net/netfilter
+          disable_dir net/mac80211
+          disable_dir net/llc
+
+      - name: Defensive seg6 header shim (IPv6 off)
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          hdr="include/net/seg6.h"
+          if [ -f "$hdr" ] && grep -q 'return net->ipv6.seg6_data;' "$hdr"; then
+            sed -i 's|return net->ipv6.seg6_data;|#ifdef CONFIG_IPV6\nreturn net->ipv6.seg6_data;\n#else\nreturn NULL;\n#endif|' "$hdr"
+            echo "[CI] Patched $hdr to tolerate CONFIG_IPV6=n"
+          fi
+          # Also guard direct include in filter.c if present
+          if [ -f net/core/filter.c ] && grep -q '^#include <net/seg6.h>' net/core/filter.c; then
+            sed -i 's|#include <net/seg6.h>|#if IS_ENABLED(CONFIG_IPV6_SEG6_BPF)\n#include <net/seg6.h>\n#endif|' net/core/filter.c
+          fi
+
+      # ===== fs Makefile filter for NFS stacks =====
       - name: Filter NFS/LOCKD/SUNRPC from fs/Makefile
         working-directory: kernel
         run: |
@@ -133,31 +176,7 @@ jobs:
             } >> fs/Makefile
           fi
 
-      - name: Filter BCM and Berlin clock directories from drivers/clk/Makefile
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-          if ! grep -q 'CI filter: disable bcm/berlin clocks' drivers/clk/Makefile; then
-            {
-              echo ''
-              echo '# CI filter: disable bcm/berlin clocks on sm8150'
-              echo 'subdir-y := $(filter-out bcm berlin,$(subdir-y))'
-              echo 'subdir-m := $(filter-out bcm berlin,$(subdir-m))'
-              echo '# end CI filter'
-            } >> drivers/clk/Makefile
-          fi
-          for d in drivers/clk/bcm drivers/clk/berlin; do
-            if [ -f "$d/Makefile" ]; then
-              mv -f "$d/Makefile" "$d/Makefile.bak" || true
-              printf '# disabled in CI for sm8150\nobj-y :=\nobj-m :=\n' > "$d/Makefile"
-            fi
-          done
-          # Optional: ensure RPi SoC audio path is no-op if present
-          if [ -f sound/soc/bcm/Makefile ]; then
-            mv -f sound/soc/bcm/Makefile sound/soc/bcm/Makefile.bak || true
-            printf '# disabled in CI for sm8150\nobj-y :=\nobj-m :=\n' > sound/soc/bcm/Makefile
-          fi
-
+      # ===== ACPI subtree filter on DT/arm64 =====
       - name: Filter ACPI dir from drivers/Makefile
         working-directory: kernel
         run: |
@@ -171,7 +190,7 @@ jobs:
             } >> drivers/Makefile
           fi
 
-      # 1) Seed .config into O=out
+      # ===== 1) defconfig =====
       - name: Prepare kernel output directory (defconfig)
         working-directory: kernel
         run: |
@@ -182,13 +201,12 @@ jobs:
           mkdir -p out
           make O=out ARCH=arm64 ${KERNEL_DEFCONFIG}
 
-      # 2) Non-interactive finalize + aggressive enforcement (net/BPF/clk/ACPI trimmed)
+      # ===== 2) Non-interactive finalize + hard enforcement =====
       - name: Finalize kernel config (non-interactive + enforce)
         working-directory: kernel
         run: |
           set -euo pipefail
           export PATH=/usr/lib/llvm-18/bin:$PATH
-
           cat > ../ci.defaults <<'EOF'
           CONFIG_QTI_GVM=n
           CONFIG_NR_CPUS=8
@@ -199,7 +217,7 @@ jobs:
           CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS=n
           CONFIG_TRANSPARENT_HUGEPAGE_MADVISE=n
           CONFIG_KSM=n
-          # FS/metrics off
+          # FS / stats off
           CONFIG_BTRFS_FS=n
           CONFIG_BTRFS_FS_POSIX_ACL=n
           CONFIG_TASKSTATS=n
@@ -210,7 +228,7 @@ jobs:
           CONFIG_NFS_V4=n
           CONFIG_LOCKD=n
           CONFIG_SUNRPC=n
-          # Networking trims (avoid IPv6/seg6/BPF/mac80211)
+          # Networking trims (avoid IPv6/seg6/BPF/mac80211/netfilter)
           CONFIG_IPV6=n
           CONFIG_IPV6_SEG6_LWTUNNEL=n
           CONFIG_IPV6_SEG6_BPF=n
@@ -223,10 +241,17 @@ jobs:
           CONFIG_NET_CLS_BPF=n
           CONFIG_NET_ACT_BPF=n
           CONFIG_MAC80211=n
-          # Broadcom/other clocks off
+          CONFIG_BT=n
+          CONFIG_VLAN_8021Q=n
+          CONFIG_NET_9P=n
+          CONFIG_9P_FS=n
+          # Vendor clocks off
           CONFIG_COMMON_CLK_BCM=n
           CONFIG_CLK_BCM_IPROC=n
           CONFIG_CLK_BCM2835=n
+          CONFIG_COMMON_CLK_HI3660=n
+          CONFIG_COMMON_CLK_HI3670=n
+          CONFIG_COMMON_CLK_HI6220=n
           # ACPI off
           CONFIG_ACPI=n
           CONFIG_ACPI_EC=n
@@ -239,7 +264,7 @@ jobs:
           CONFIG_PCI_QUIRKS=n
           CONFIG_PCIEAER=n
           CONFIG_PCIEPORTBUS=n
-          # General non-interactive defaults
+          # Non-interactive defaults
           CONFIG_COMPILE_TEST=n
           CONFIG_LOCALVERSION=""
           CONFIG_LOCALVERSION_AUTO=y
@@ -254,7 +279,6 @@ jobs:
 
           make O=out ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../ci.defaults
 
-          # scripts/config enforcement if present
           if [ -x scripts/config ]; then
             ./scripts/config --file out/.config \
               --disable CONFIG_QTI_GVM --set-val CONFIG_NR_CPUS 8 \
@@ -268,131 +292,8 @@ jobs:
               --disable CONFIG_BPF_SYSCALL --disable CONFIG_BPF_JIT \
               --disable CONFIG_NETFILTER --disable CONFIG_NETFILTER_ADVANCED --disable CONFIG_NETFILTER_XTABLES \
               --disable CONFIG_XDP_SOCKETS --disable CONFIG_NET_CLS_BPF --disable CONFIG_NET_ACT_BPF \
-              --disable CONFIG_MAC80211 \
+              --disable CONFIG_MAC80211 --disable CONFIG_BT --disable CONFIG_VLAN_8021Q \
+              --disable CONFIG_NET_9P --disable CONFIG_9P_FS \
               --disable CONFIG_COMMON_CLK_BCM --disable CONFIG_CLK_BCM_IPROC --disable CONFIG_CLK_BCM2835 \
-              --disable CONFIG_ACPI --disable CONFIG_ACPI_EC --disable CONFIG_ACPI_LPSS --disable CONFIG_ACPI_APEI --disable CONFIG_ACPI_APD --disable CONFIG_ACPI_PCI_SLOT --disable CONFIG_ACPI_PCI_ROOT \
-              --disable CONFIG_PCI_QUIRKS --disable CONFIG_PCIEAER --disable CONFIG_PCIEPORTBUS \
-              --disable CONFIG_COMPILE_TEST \
-              --set-str CONFIG_LOCALVERSION "" --enable CONFIG_LOCALVERSION_AUTO \
-              --enable CONFIG_KERNEL_GZIP \
-              --disable CONFIG_KERNEL_BZIP2 --disable CONFIG_KERNEL_LZMA --disable CONFIG_KERNEL_XZ --disable CONFIG_KERNEL_LZO --disable CONFIG_KERNEL_LZ4 || true
-          fi
-
-          # Sed fallback to guarantee enforcement
-          for s in CONFIG_BTRFS_FS CONFIG_BTRFS_FS_POSIX_ACL CONFIG_TASKSTATS CONFIG_TASK_DELAY_ACCT CONFIG_TASK_XACCT CONFIG_TASK_IO_ACCOUNTING \
-                   CONFIG_NFS_FS CONFIG_NFS_V4 CONFIG_LOCKD CONFIG_SUNRPC \
-                   CONFIG_HUGETLB_PAGE CONFIG_HUGETLBFS CONFIG_TRANSPARENT_HUGEPAGE CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS CONFIG_TRANSPARENT_HUGEPAGE_MADVISE CONFIG_KSM \
-                   CONFIG_IPV6 CONFIG_IPV6_SEG6_LWTUNNEL CONFIG_IPV6_SEG6_BPF \
-                   CONFIG_BPF_SYSCALL CONFIG_BPF_JIT CONFIG_NETFILTER CONFIG_NETFILTER_ADVANCED CONFIG_NETFILTER_XTABLES \
-                   CONFIG_XDP_SOCKETS CONFIG_NET_CLS_BPF CONFIG_NET_ACT_BPF CONFIG_MAC80211 \
-                   CONFIG_COMMON_CLK_BCM CONFIG_CLK_BCM_IPROC CONFIG_CLK_BCM2835 \
-                   CONFIG_ACPI CONFIG_ACPI_EC CONFIG_ACPI_LPSS CONFIG_ACPI_APEI CONFIG_ACPI_APD CONFIG_ACPI_PCI_SLOT CONFIG_ACPI_PCI_ROOT \
-                   CONFIG_PCI_QUIRKS CONFIG_PCIEAER CONFIG_PCIEPORTBUS CONFIG_COMPILE_TEST; do
-            sed -i "s/^${s}=.*/${s}=n/" out/.config
-          done
-          sed -i 's/^# CONFIG_NR_CPUS is not set$/CONFIG_NR_CPUS=8/' out/.config
-          sed -i 's/^CONFIG_NR_CPUS=.*/CONFIG_NR_CPUS=8/' out/.config
-          sed -i 's/^CONFIG_KERNEL_GZIP=.*/CONFIG_KERNEL_GZIP=y/' out/.config
-          for c in CONFIG_KERNEL_BZIP2 CONFIG_KERNEL_LZMA CONFIG_KERNEL_XZ CONFIG_KERNEL_LZO CONFIG_KERNEL_LZ4; do
-            sed -i "s/^${c}=.*/${c}=n/" out/.config
-          done
-          if ! grep -q '^CONFIG_CROSS_COMPILE=' out/.config; then
-            echo 'CONFIG_CROSS_COMPILE="aarch64-linux-gnu-"' >> out/.config
-          else
-            sed -i 's/^CONFIG_CROSS_COMPILE=.*/CONFIG_CROSS_COMPILE="aarch64-linux-gnu-"/' out/.config
-          fi
-
-          # Re-resolve deps and write auto.conf
-          make O=out ARCH=arm64 olddefconfig
-
-          echo "==== Debug: critical toggles snapshot ===="
-          egrep -E '^(CONFIG_NR_CPUS|CONFIG_IPV6|CONFIG_IPV6_SEG6_BPF|CONFIG_BPF_SYSCALL|CONFIG_NETFILTER|CONFIG_MAC80211|CONFIG_COMMON_CLK_BCM|CONFIG_ACPI|CONFIG_NFS|CONFIG_BTRFS|CONFIG_TASKSTATS|CONFIG_HUGETLB_PAGE|CONFIG_TRANSPARENT_HUGEPAGE|CONFIG_KERNEL_GZIP)=' out/.config || true
-
-      # 3) Build scripts and headers only after config settled
-      - name: Prepare scripts and headers
-        working-directory: ./kernel
-        run: |
-          set -euo pipefail
-          export PATH=/usr/lib/llvm-18/bin:$PATH
-          export HOSTCC=clang-18
-          export HOSTCXX=clang++-18
-          make ${KERNEL_CMDLINE} scripts CC="ccache clang-18"
-          make ${KERNEL_CMDLINE} prepare CC="ccache clang-18"
-
-      - name: Build kernel
-        working-directory: kernel
-        env:
-          KBUILD_OUTPUT: out
-        run: |
-          set -euo pipefail
-          export PATH=/usr/lib/llvm-18/bin:$PATH
-          export LD_LIBRARY_PATH="/usr/lib/llvm-18/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          export DTC_EXT=dtc
-          export HOSTCC=clang-18
-          export HOSTCXX=clang++-18
-
-          make O=out ARCH=arm64 olddefconfig
-
-          # Fail-fast verification of critical toggles
-          if ! grep -q '^CONFIG_NR_CPUS=8' out/.config; then echo "Error: NR_CPUS not 8"; exit 1; fi
-          for s in CONFIG_IPV6 CONFIG_IPV6_SEG6_LWTUNNEL CONFIG_IPV6_SEG6_BPF CONFIG_BPF_SYSCALL CONFIG_BPF_JIT \
-                   CONFIG_NETFILTER CONFIG_NETFILTER_ADVANCED CONFIG_NETFILTER_XTABLES CONFIG_XDP_SOCKETS CONFIG_NET_CLS_BPF CONFIG_NET_ACT_BPF \
-                   CONFIG_MAC80211 \
-                   CONFIG_COMMON_CLK_BCM CONFIG_CLK_BCM_IPROC CONFIG_CLK_BCM2835 \
-                   CONFIG_ACPI CONFIG_NFS_FS CONFIG_BTRFS_FS CONFIG_TASKSTATS CONFIG_HUGETLB_PAGE CONFIG_TRANSPARENT_HUGEPAGE; do
-            if grep -q "^${s}=[my]" out/.config; then echo "Error: ${s} still enabled"; exit 1; fi
-          done
-
-          make ${KERNEL_CMDLINE} CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j"$(nproc)"
-          test -f out/arch/arm64/boot/Image
-          cp out/arch/arm64/boot/Image ../AnyKernel3
-
-      - name: Build Wi-Fi Module (qca_cld3)
-        working-directory: ./kernel
-        run: |
-          set -euo pipefail
-          export PATH=/usr/lib/llvm-18/bin:$PATH
-          export LD_LIBRARY_PATH="/usr/lib/llvm-18/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          export HOSTCC=clang-18
-          export HOSTCXX=clang++-18
-
-          make ${KERNEL_CMDLINE} modules_prepare CC="ccache clang-18"
-          make ${KERNEL_CMDLINE} CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" \
-            OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" \
-            -j"$(nproc)" M=drivers/staging/qcacld-3.0 modules
-
-          sudo mkdir -p ../modules/vendor/lib/modules
-          sudo find out/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \;
-          sudo chown -R "$(id -u)":"$(id -g)" ../modules
-
-      - name: Package Kernel
-        run: |
-          cd AnyKernel3
-          zip -r ../${{ env.OUTPUT_ZIP_NAME }}.zip *
-          cd ..
-
-      - name: Package Wi-Fi Module
-        run: |
-          if [ ! -d "modules/vendor/lib/modules" ] || ! ls modules/vendor/lib/modules/*.ko >/dev/null 2>&1; then
-            echo "Error: No Wi-Fi modules found to package!"
-            exit 1
-          fi
-          cd modules
-          zip -r ../${{ env.OUTPUT_ZIP_NAME }}-modules.zip *
-          cd ..
-
-      - name: Upload kernel build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-out
-          path: kernel/out
-          if-no-files-found: warn
-
-      - name: Upload zips
-        uses: actions/upload-artifact@v4
-        with:
-          name: outputs
-          path: |
-            ${{ env.OUTPUT_ZIP_NAME }}.zip
-            ${{ env.OUTPUT_ZIP_NAME }}-modules.zip
-          if-no-files-found: error
+              --disable CONFIG_COMMON_CLK_HI3660 --disable CONFIG_COMMON_CLK_HI3670 --disable CONFIG_COMMON_CLK_HI6220 \
+              --disable CONFIG_ACPI --disable CONFIG_ACPI_EC --disable CONFIG_ACPI_LPSS --disable CONFIG_ACPI_AP
