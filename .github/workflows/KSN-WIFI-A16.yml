@@ -95,7 +95,6 @@ jobs:
           export PATH="/usr/lib/llvm-18/bin:$PATH"
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
 
-      # MM fixes for hugetlb/THP
       - name: Apply hugetlbpage fix patch
         working-directory: kernel
         run: |
@@ -124,38 +123,31 @@ jobs:
           set -euo pipefail
           sed -i 's/atomic_long_dec(&mm->nr_ptes);/\/\* compat: mm->nr_ptes removed \*\/ do {} while (0);/' mm/khugepaged.c || true
 
-      # Blackhole unwanted Kbuild and Makefile in important directories
       - name: Hard-blackhole unwanted Kbuild subtrees (CLK and NET)
         working-directory: kernel
         run: |
           set -euo pipefail
-          disable_dir() {
+          force_blackhole() {
             local d="$1"
             if [ -d "$d" ]; then
-              if [ -f "$d/Makefile" ]; then
-                mv -f "$d/Makefile" "$d/Makefile.bak" || true
-              fi
-              if [ -f "$d/Kbuild" ]; then
-                mv -f "$d/Kbuild" "$d/Kbuild.bak" || true
-              fi
-              echo -e '# disabled in CI for sm8150\nobj-y :=\nobj-m :=' > "$d/Makefile"
-              chmod 644 "$d/Makefile"
-              echo "[CI] Blackholed $d"
-            else
-              echo "[CI WARNING] Directory $d not found"
+              sudo chmod -R u+rwX "$d"
+              # Always overwrite, do not "move"
+              echo -e '# disabled in CI for sm8150\nobj-y :=\nobj-m :=' | sudo tee "$d/Makefile" > /dev/null
+              sudo chmod 644 "$d/Makefile"
+              echo '# disabled in CI for sm8150' | sudo tee "$d/Kbuild" > /dev/null
             fi
           }
-          disable_dir drivers/clk/bcm
-          disable_dir drivers/clk/berlin
-          disable_dir drivers/clk/hisilicon
-          disable_dir net/ipv6
-          disable_dir net/bridge
-          disable_dir net/8021q
-          disable_dir net/bluetooth
-          disable_dir net/9p
-          disable_dir net/netfilter
-          disable_dir net/mac80211
-          disable_dir net/llc
+          force_blackhole drivers/clk/bcm
+          force_blackhole drivers/clk/berlin
+          force_blackhole drivers/clk/hisilicon
+          force_blackhole net/ipv6
+          force_blackhole net/bridge
+          force_blackhole net/8021q
+          force_blackhole net/bluetooth
+          force_blackhole net/9p
+          force_blackhole net/netfilter
+          force_blackhole net/mac80211
+          force_blackhole net/llc
 
       - name: Defensive seg6 header shim (IPv6 off)
         working-directory: kernel
@@ -170,7 +162,6 @@ jobs:
             sed -i 's|#include <net/seg6.h>|#if IS_ENABLED(CONFIG_IPV6_SEG6_BPF)\n#include <net/seg6.h>\n#endif|' net/core/filter.c
           fi
 
-      # Filter NFS/LOCKD/SUNRPC from fs
       - name: Filter NFS/LOCKD/SUNRPC from fs/Makefile
         working-directory: kernel
         run: |
@@ -184,7 +175,6 @@ jobs:
             } >> fs/Makefile
           fi
 
-      # Filter ACPI dir from drivers/Makefile
       - name: Filter ACPI dir from drivers/Makefile
         working-directory: kernel
         run: |
@@ -198,7 +188,6 @@ jobs:
             } >> drivers/Makefile
           fi
 
-      # Prepare defconfig
       - name: Prepare kernel output directory (defconfig)
         working-directory: kernel
         run: |
@@ -209,7 +198,6 @@ jobs:
           mkdir -p out
           make O=out ARCH=arm64 ${KERNEL_DEFCONFIG}
 
-      # Non-interactive config finalize and enforcement
       - name: Finalize kernel config (non-interactive + enforce)
         working-directory: kernel
         run: |
@@ -362,7 +350,6 @@ jobs:
               exit 1
             fi
           done
-
           for d in drivers/clk/hisilicon drivers/clk/bcm drivers/clk/berlin net/ipv6 net/bridge net/8021q net/bluetooth net/9p net/netfilter net/mac80211 net/llc; do
             if [ -d "$d" ]; then
               if [ -f "$d/Makefile" ] && [ -s "$d/Makefile" ]; then
