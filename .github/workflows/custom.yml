@@ -1,4 +1,4 @@
-name: custiom Build kernel and Wi-Fi Module
+name: Custiom build kernel and Wi-Fi Module
 
 on:
   workflow_dispatch:
@@ -105,6 +105,25 @@ jobs:
         echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
         echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
         echo "CONFIG_KSU_SUSFS_SUS_SU=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
+
+    - name: Fix hugetlbpage ptep allocation bug
+      working-directory: kernel
+      run: |
+        set -euo pipefail
+        src=arch/arm64/mm/hugetlbpage.c
+        if grep -q 'pte_t \*pte = NULL;' "$src" && ! grep -q 'pte_t *ptep' "$src"; then
+          sed -i '/pte_t \*pte = NULL;/a\  pte_t *ptep = NULL;' "$src"
+        fi
+        sed -i 's/ptep = huge_pmd_share(mm, vma, addr, pud);/if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);/' "$src"
+
+    - name: Set NR_CPUS if not present
+      working-directory: kernel
+      run: |
+        set -euo pipefail
+        conf=arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
+        if ! grep -q '^CONFIG_NR_CPUS=' "$conf"; then
+          echo 'CONFIG_NR_CPUS=8' >> "$conf"
+        fi
 
     - name: Prepare kernel config (non-interactive)
       working-directory: kernel
