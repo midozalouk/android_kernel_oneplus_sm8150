@@ -1,4 +1,4 @@
-name: Build kernel and Wi-Fi Module
+name: Custom Build kernel and Wi-Fi Module
 
 on:
   workflow_dispatch:
@@ -81,9 +81,14 @@ jobs:
         cp susfs_patches/kernel_patches/fs/* ./fs/
         cp susfs_patches/kernel_patches/include/linux/* ./include/linux/
         cd KernelSU
-        patch -p1 -F 3 < 10_enable_susfs_for_ksu.patch
+        patch -N -p1 -F 3 < 10_enable_susfs_for_ksu.patch || echo "Patch already applied or failed (ignore if already applied)"
         cd ..
-        patch -p1 -F 3 < 50_add_susfs_in_kernel-4.14.patch
+        patch -N -p1 -F 3 < 50_add_susfs_in_kernel-4.14.patch || echo "Patch already applied or failed (ignore if already applied)"
+        find . -name "*.rej" -exec echo "Patch reject: {}" \; -exec cat {} \;
+        if find . -name "*.rej" | grep -q .; then
+          echo "FAIL: Some SUSFS hunks failed. Check your kernel version/patches above for why.";
+          exit 1;
+        fi
 
     - name: Add SUSFS configs if enabled
       if: ${{ github.event.inputs.enable_susfs == 'true' }}
@@ -107,7 +112,6 @@ jobs:
         set -euo pipefail
         export PATH=/usr/lib/llvm-18/bin:$PATH
         LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-none-linux-gnu- make ${{ github.event.inputs.defconfig_file }}
-        # Use custom build script if exists, otherwise make
         if [ -f build/build.sh ]; then
           LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-none-linux-gnu- BUILD_CONFIG=common/build.config.aarch64 build/build.sh
         else
