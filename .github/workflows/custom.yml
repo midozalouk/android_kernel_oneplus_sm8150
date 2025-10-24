@@ -1,0 +1,165 @@
+name: Build kernel with optional SUSFS and KernelSU
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo_url:
+        description: 'Kernel git repository URL'
+        required: true
+        default: 'https://github.com/LineageOS/android_kernel_oneplus_sm8150'
+      kernel_branch:
+        description: 'Kernel branch'
+        required: true
+        default: 'lineage-22.1'
+      defconfig_file:
+        description: 'Kernel defconfig filename'
+        required: true
+        default: 'lineage_sm8150_defconfig'
+      use_kernelsu:
+        description: 'Use KernelSU (true) or KernelSU-Next (false)'
+        required: true
+        default: 'true'
+      enable_susfs:
+        description: 'Enable SUSFS patches'
+        required: true
+        default: 'false'
+      release_name:
+        description: 'Final release ZIP base name'
+        required: true
+        default: 'OP7_custom_kernel'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      CCACHE_HARDLINK: true
+      CCACHE_NOHASHDIR: true
+      CCACHE_MAXSIZE: 3G
+      CCACHE_COMPILERCHECK: '%compiler% -dumpmachine; %compiler% -dumpversion'
+      PATH: /usr/lib/llvm-18/bin:${{ env.PATH }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare workspace and clone kernel
+        run: |
+          set -euo pipefail
+          rm -rf kernel builds || true
+          mkdir -p builds
+          git clone --depth=1 --branch ${{ github.event.inputs.kernel_branch }} ${{ github.event.inputs.kernel_repo_url }} kernel
+          cd kernel
+          git submodule update --init --recursive
+
+      - name: Setup dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang-18 llvm-18 lld-18 \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            binutils make python3 libssl-dev bc bison flex unzip \
+            ca-certificates xz-utils mkbootimg cpio device-tree-compiler git git-lfs zip
+
+      - name: Prepare KernelSU
+        if: ${{ github.event.inputs.use_kernelsu == 'true' }}
+        working-directory: kernel
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s stable
+
+      - name: Prepare KernelSU-Next
+        if: ${{ github.event.inputs.use_kernelsu == 'false' }}
+        working-directory: kernel
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
+
+      - name: Apply SUSFS patches
+        if: ${{ github.event.inputs.enable_susfs == 'true' }}
+        working-directory: kernel
+        run: |
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.14 susfs_patches
+          cp susfs_patches/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
+          cp susfs_patches/kernel_patches/50_add_susfs_in_kernel-4.14.patch .
+          cp susfs_patches/kernel_patches/fs/* fs/
+          cp susfs_patches/kernel_patches/include/linux/* include/linux/
+          cd KernelSU
+          patch -p1 -F 3 < 10_enable_susfs_for_ksu.patch
+          cd ..
+          patch -p1 -F 3 < 50_add_susfs_in_kernel-4.14.patch
+
+      - name: Add SUSFS configs if enabled
+        if: ${{ github.event.inputs.enable_susfs == 'true' }}
+        working-directory: kernel
+        run: |
+          echo "CONFIG_KSU=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
+          echo "CONFIG_KSU_SUSFS=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
+          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
+          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
+          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
+          echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
+          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
+          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
+          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
+          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
+          echo "CONFIG_KSU_SUSFS_SUS_SU=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
+
+      - name: Build Kernel
+        working-directory: kernel
+        env:
+          CROSS_COMPILE: aarch64-none-linux-gnu-
+          ARCH: arm64
+          LTO: thin
+        run: |
+          make ${{ github.event.inputs.defconfig_file }}
+          # Use the build/build.sh from repo if present, fallback to make
+          if [ -f build/build.sh ]; then
+            LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-none-linux-gnu- BUILD_CONFIG=common/build.config.aarch64 build/build.sh
+          else
+            make -j$(nproc)
+          fi
+
+      - name: Copy kernel Image.lz4
+        if: exists('kernel/out/android12-5.10/dist/Image.lz4')
+        run: |
+          cp kernel/out/android12-5.10/dist/Image.lz4 kernel/AnyKernel3/Image.lz4
+
+      - name: Package Kernel
+        working-directory: kernel/AnyKernel3
+        run: |
+          zip -r ../${{ github.event.inputs.release_name }}.zip *
+
+      - name: Build Wi-Fi module (qca_cld3)
+        working-directory: kernel
+        env:
+          CROSS_COMPILE: aarch64-none-linux-gnu-
+          ARCH: arm64
+        run: |
+          make modules_prepare
+          make -C drivers/staging/qcacld-3.0 M=$(pwd)/drivers/staging/qcacld-3.0 modules
+          mkdir -p ../modules/vendor/lib/modules
+          find out/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \;
+          sudo chown -R $(id -u):$(id -g) ../modules
+
+      - name: Package Wi-Fi modules
+        run: |
+          if [ ! -d "modules/vendor/lib/modules" ] || ! ls modules/vendor/lib/modules/*.ko >/dev/null 2>&1; then
+            echo "No Wi-Fi modules found."
+            exit 1
+          fi
+          cd modules
+          zip -r ../${{ github.event.inputs.release_name }}-modules.zip *
+          cd ..
+
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-output
+          path: kernel/out
+
+      - name: Upload zips
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-zips
+          path: |
+            kernel/${{ github.event.inputs.release_name }}.zip
+            ${{ github.event.inputs.release_name }}-modules.zip
