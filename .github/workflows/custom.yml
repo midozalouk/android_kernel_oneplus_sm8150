@@ -1,4 +1,4 @@
-name: Custom Build kernel and Wi-Fi Module
+name: custiom Build kernel and Wi-Fi Module
 
 on:
   workflow_dispatch:
@@ -106,17 +106,20 @@ jobs:
         echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
         echo "CONFIG_KSU_SUSFS_SUS_SU=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
 
+    - name: Prepare kernel config (non-interactive)
+      working-directory: kernel
+      run: |
+        set -euo pipefail
+        export PATH=/usr/lib/llvm-18/bin:$PATH
+        LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make ${{ github.event.inputs.defconfig_file }}
+        LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make olddefconfig
+
     - name: Build kernel
       working-directory: kernel
       run: |
         set -euo pipefail
         export PATH=/usr/lib/llvm-18/bin:$PATH
-        LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-none-linux-gnu- make ${{ github.event.inputs.defconfig_file }}
-        if [ -f build/build.sh ]; then
-          LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-none-linux-gnu- BUILD_CONFIG=common/build.config.aarch64 build/build.sh
-        else
-          make -j$(nproc)
-        fi
+        LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j$(nproc)
 
     - name: Copy kernel Image.lz4 if exists
       if: always()
@@ -137,8 +140,8 @@ jobs:
       run: |
         set -euo pipefail
         export PATH=/usr/lib/llvm-18/bin:$PATH
-        LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-none-linux-gnu- make modules_prepare
-        LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-none-linux-gnu- make -j$(nproc) -C drivers/staging/qcacld-3.0 M=$(pwd)/drivers/staging/qcacld-3.0 modules
+        LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make modules_prepare
+        LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j$(nproc) -C drivers/staging/qcacld-3.0 M=$(pwd)/drivers/staging/qcacld-3.0 modules
         mkdir -p ../modules/vendor/lib/modules
         find out/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \;
         sudo chown -R $(id -u):$(id -g) ../modules
