@@ -43,12 +43,11 @@ jobs:
       with:
         fetch-depth: 0
 
-    - name: Prepare kernel source
+    - name: Prepare kernel source (fresh)
       run: |
         set -euo pipefail
-        rm -rf kernel builds || true
-        mkdir -p builds
-        git clone --depth=1 --branch ${{ github.event.inputs.kernel_branch }} ${{ github.event.inputs.kernel_repo_url }} kernel
+        rm -rf kernel modules || true
+        git clone --depth=1 --branch "${{ github.event.inputs.kernel_branch }}" "${{ github.event.inputs.kernel_repo_url }}" kernel
         cd kernel
         git submodule update --init --recursive
 
@@ -76,17 +75,18 @@ jobs:
       run: |
         set -euo pipefail
         git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.14 susfs_patches
-        cp susfs_patches/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
-        cp susfs_patches/kernel_patches/50_add_susfs_in_kernel-4.14.patch .
-        cp susfs_patches/kernel_patches/fs/* ./fs/
-        cp susfs_patches/kernel_patches/include/linux/* ./include/linux/
-        cd KernelSU
-        patch -N -p1 -F 3 < 10_enable_susfs_for_ksu.patch || echo "Patch already applied or failed"
-        cd ..
-        patch -N -p1 -F 3 < 50_add_susfs_in_kernel-4.14.patch || echo "Patch already applied or failed"
-        find . -name "*.rej" -exec echo "Patch reject: {}" \; -exec cat {} \;
+        cp susfs_patches/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/ || true
+        cp susfs_patches/kernel_patches/50_add_susfs_in_kernel-4.14.patch . || true
+        cp -r susfs_patches/kernel_patches/fs/* ./fs/ || true
+        cp -r susfs_patches/kernel_patches/include/linux/* ./include/linux/ || true
+        if [ -f KernelSU/10_enable_susfs_for_ksu.patch ]; then
+          (cd KernelSU && patch -N -p1 -F3 < 10_enable_susfs_for_ksu.patch) || echo "KernelSU SUSFS patch already applied"
+        fi
+        if [ -f 50_add_susfs_in_kernel-4.14.patch ]; then
+          patch -N -p1 -F3 < 50_add_susfs_in_kernel-4.14.patch || echo "Kernel core SUSFS patch already applied"
+        fi
         if find . -name "*.rej" | grep -q .; then
-          echo "FAIL: Some SUSFS hunks failed. Check your kernel version/patches above for why.";
+          echo "SUSFS patch rejects found:"; find . -name "*.rej" -print -exec sed -n '1,120p' {} \;;
           exit 1;
         fi
 
@@ -94,101 +94,123 @@ jobs:
       if: ${{ github.event.inputs.enable_susfs == 'true' }}
       working-directory: kernel
       run: |
-        echo "CONFIG_KSU=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
-        echo "CONFIG_KSU_SUSFS=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
-        echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
-        echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
-        echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
-        echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
-        echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
-        echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
-        echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
-        echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
-        echo "CONFIG_KSU_SUSFS_SUS_SU=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
+        conf="arch/arm64/configs/${{ github.event.inputs.defconfig_file }}"
+        {
+          echo "CONFIG_KSU=y"
+          echo "CONFIG_KSU_SUSFS=y"
+          echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+          echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y"
+          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
+          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+          echo "CONFIG_KSU_SUSFS_SUS_SU=y"
+        } >> "$conf"
 
-    - name: Remove CONFIG_TASKSTATS and related (CI robust)
+    - name: Disable taskstats family (robust)
       working-directory: kernel
       run: |
-        set -euo pipefail
-        conf=arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
+        set -e
+        conf="arch/arm64/configs/${{ github.event.inputs.defconfig_file }}"
         for opt in CONFIG_TASKSTATS CONFIG_TASK_DELAY_ACCT CONFIG_TASK_XACCT CONFIG_TASK_IO_ACCOUNTING; do
-          sed -i "/$opt/d" "$conf"
-          echo "$opt=n" >> "$conf"
+          sed -i "/^$opt[= ]/d" "$conf" || true
+          echo "${opt}=n" >> "$conf"
         done
+        tail -n 20 "$conf" || true
 
-    - name: Fix btrfs timespec/timespec64 incompatibility (idempotent)
+    - name: Patch btrfs to timespec64 (idempotent, safe)
       working-directory: kernel
       run: |
         set -e
-        FILE=fs/btrfs/inode.c
-        # Only change line if the unpatched line exists
-        if grep -qE "^\s*struct timespec now = current_time\(&parent_inode->vfs_inode\);" "$FILE"; then
-          sed -i 's|^\(\s*\)struct timespec now = current_time(&parent_inode->vfs_inode);|\1struct timespec64 now = current_time(&parent_inode->vfs_inode);|' "$FILE"
-          echo "✓ Patched btrfs timespec to timespec64"
+        file=fs/btrfs/inode.c
+        # Guard: only patch if exact unpatched line exists
+        if grep -qE "^\s*struct timespec now = current_time\(&parent_inode->vfs_inode\);" "$file"; then
+          sed -i 's|^\(\s*\)struct timespec now = current_time(&parent_inode->vfs_inode);|\1struct timespec64 now = current_time(&parent_inode->vfs_inode);|' "$file"
+          echo "Patched btrfs timespec -> timespec64"
         else
-          echo "✓ btrfs already patched or not present"
+          echo "Skip btrfs timespec patch (already patched or different source)"
         fi
-        # Show result for debugging
-        echo "--- btrfs/inode.c context after patch ---"
-        grep -A2 -B1 "timespec" "$FILE" || true
+        # Sanity: ensure no corrupted line remains
+        if grep -n "struct timespec64 now = current_time(.*struct timespec" "$file"; then
+          echo "Detected corruption in btrfs timespec line"; sed -n '6615,6640p' "$file"; exit 1;
+        fi
 
-    - name: Fix try_to_unmap argument count in huge_memory.c (idempotent)
+    - name: Patch try_to_unmap arg count (idempotent)
       working-directory: kernel
       run: |
         set -e
-        FILE=mm/huge_memory.c
-        if grep -q 'try_to_unmap(page, ttu_flags);' "$FILE"; then
-          sed -i 's|try_to_unmap(page, ttu_flags);|try_to_unmap(page, ttu_flags, NULL);|g' "$FILE"
-          echo "✓ Patched try_to_unmap with NULL argument"
+        file=mm/huge_memory.c
+        if grep -q 'try_to_unmap(page, ttu_flags);' "$file"; then
+          sed -i 's|try_to_unmap(page, ttu_flags);|try_to_unmap(page, ttu_flags, NULL);|g' "$file"
+          echo "Patched try_to_unmap 2->3 args"
         else
-          echo "✓ try_to_unmap already patched or not present"
+          echo "Skip try_to_unmap patch (already correct)"
         fi
-        echo "--- huge_memory.c context after patch ---"
-        grep -A1 -B1 "try_to_unmap" "$FILE" || true
+        grep -n "try_to_unmap" "$file" || true
 
-    - name: Fix hugetlbpage ptep allocation bug (idempotent)
+    - name: Patch hugetlbpage ptep handling (idempotent)
       working-directory: kernel
       run: |
         set -e
-        FILE=arch/arm64/mm/hugetlbpage.c
-        if grep -q 'pte_t \*pte = NULL;' "$FILE" && ! grep -q 'pte_t \*ptep' "$FILE"; then
-          sed -i '/pte_t \*pte = NULL;/a\  pte_t *ptep = NULL;' "$FILE"
-          echo "✓ Added ptep declaration"
-        else
-          echo "✓ ptep already declared or not needed"
+        file=arch/arm64/mm/hugetlbpage.c
+        # Add ptep declaration near top of function if missing
+        if grep -n "huge_pte_alloc" "$file" >/dev/null 2>&1; then
+          # Insert ptep declaration only if not present in function
+          if ! awk '/huge_pte_alloc/{f=1} f && /{/{print NR; exit}' "$file" | xargs -I{} sed -n '{},+80p' "$file" | grep -q "pte_t \*ptep"; then
+            line=$(awk '/huge_pte_alloc/{f=1} f && /{/{print NR; exit}' "$file")
+            if [ -n "$line" ]; then
+              # Insert after opening brace of huge_pte_alloc
+              ed -s "$file" <<'ED'
+/huge_pte_alloc/
+/{/+1
+a
+        pte_t *ptep = NULL;
+.
+w
+q
+ED
+              echo "Inserted ptep declaration in huge_pte_alloc"
+            fi
+          else
+            echo "ptep already declared in huge_pte_alloc"
+          fi
         fi
-        if grep -q 'ptep = huge_pmd_share(mm, vma, addr, pud);' "$FILE"; then
-          sed -i 's/ptep = huge_pmd_share(mm, vma, addr, pud);/if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);/' "$FILE"
-          echo "✓ Added ptep null check"
+        # Ensure guarded use of huge_pmd_share
+        if grep -q 'ptep = huge_pmd_share(mm, vma, addr, pud);' "$file"; then
+          sed -i 's/ptep = huge_pmd_share(mm, vma, addr, pud);/if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);/' "$file"
+          echo "Guarded huge_pmd_share assignment with null check"
         else
-          echo "✓ ptep null check already present"
+          echo "huge_pmd_share assignment already guarded or absent"
         fi
+        # Show context around the lines
+        grep -n "huge_pte_alloc" "$file" || true
+        grep -n "ptep = huge_pmd_share" "$file" || true
+        sed -n '220,260p' "$file" || true
 
-    - name: Remove mm_struct nr_ptes usage (idempotent)
+    - name: Comment out mm->nr_ptes usage (idempotent)
       working-directory: kernel
       run: |
         set -e
-        FILE=mm/khugepaged.c
-        if grep -q 'mm->nr_ptes' "$FILE"; then
-          # Comment out lines instead of deleting to avoid syntax breaks
-          sed -i 's/\(.*mm->nr_ptes.*\)/\/\* REMOVED_for_ARM64 \1 \*\//' "$FILE"
-          echo "✓ Commented out nr_ptes references"
+        file=mm/khugepaged.c
+        if grep -q 'mm->nr_ptes' "$file"; then
+          sed -i 's/\(.*mm->nr_ptes.*\)/\/\* REMOVED_for_ARM64 \1 \*\//' "$file"
+          echo "Commented mm->nr_ptes usage"
         else
-          echo "✓ nr_ptes already removed or not present"
+          echo "nr_ptes usage not found (already handled)"
         fi
-        echo "--- khugepaged.c nr_ptes context after patch ---"
-        grep -n "nr_ptes\|REMOVED_for_ARM64" "$FILE" || true
+        grep -n "nr_ptes\|REMOVED_for_ARM64" "$file" || true
 
-    - name: Set NR_CPUS if not present
+    - name: Ensure NR_CPUS
       working-directory: kernel
       run: |
-        set -euo pipefail
-        conf=arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
-        if ! grep -q '^CONFIG_NR_CPUS=' "$conf"; then
-          echo 'CONFIG_NR_CPUS=8' >> "$conf"
-        fi
+        set -e
+        conf="arch/arm64/configs/${{ github.event.inputs.defconfig_file }}"
+        grep -q '^CONFIG_NR_CPUS=' "$conf" || echo 'CONFIG_NR_CPUS=8' >> "$conf"
+        tail -n 5 "$conf" || true
 
-    - name: Prepare kernel config (non-interactive)
+    - name: Configure kernel (non-interactive)
       working-directory: kernel
       run: |
         set -euo pipefail
