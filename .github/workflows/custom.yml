@@ -1,4 +1,4 @@
-name: Build kernel and Wi-Fi module
+name: Custom build kernel and Wi-Fi module
 
 on:
   workflow_dispatch:
