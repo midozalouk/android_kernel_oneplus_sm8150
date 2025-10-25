@@ -81,9 +81,9 @@ jobs:
         cp susfs_patches/kernel_patches/fs/* ./fs/
         cp susfs_patches/kernel_patches/include/linux/* ./include/linux/
         cd KernelSU
-        patch -N -p1 -F 3 < 10_enable_susfs_for_ksu.patch || echo "Patch already applied or failed (ignore if already applied)"
+        patch -N -p1 -F 3 < 10_enable_susfs_for_ksu.patch || echo "Patch already applied or failed"
         cd ..
-        patch -N -p1 -F 3 < 50_add_susfs_in_kernel-4.14.patch || echo "Patch already applied or failed (ignore if already applied)"
+        patch -N -p1 -F 3 < 50_add_susfs_in_kernel-4.14.patch || echo "Patch already applied or failed"
         find . -name "*.rej" -exec echo "Patch reject: {}" \; -exec cat {} \;
         if find . -name "*.rej" | grep -q .; then
           echo "FAIL: Some SUSFS hunks failed. Check your kernel version/patches above for why.";
@@ -120,14 +120,14 @@ jobs:
       working-directory: kernel
       run: |
         set -euo pipefail
-        f=fs/btrfs/inode.c
-        if grep -q 'struct timespec now = current_time' "$f"; then
-          sed -i 's|struct timespec now = current_time(&parent_inode->vfs_inode);|struct timespec64 now = current_time(&parent_inode->vfs_inode);|' "$f"
-          sed -i 's|parent_inode->vfs_inode.i_mtime = now;|parent_inode->vfs_inode.i_mtime = now;|' "$f"
-          sed -i 's|parent_inode->vfs_inode.i_ctime = now;|parent_inode->vfs_inode.i_ctime = now;|' "$f"
+        file=fs/btrfs/inode.c
+        if grep -q 'struct timespec now = current_time(&parent_inode->vfs_inode);' "$file"; then
+          sed -i 's|struct timespec now = current_time(&parent_inode->vfs_inode);|struct timespec64 now = current_time(&parent_inode->vfs_inode);|' "$file"
+          sed -i 's|parent_inode->vfs_inode.i_mtime = now;|parent_inode->vfs_inode.i_mtime = now;|' "$file"
+          sed -i 's|parent_inode->vfs_inode.i_ctime = now;|parent_inode->vfs_inode.i_ctime = now;|' "$file"
         fi
 
-    - name: Shim try_to_unmap for huge_memory.c (fix argument count)
+    - name: Fix try_to_unmap argument count in huge_memory.c
       working-directory: kernel
       run: |
         set -euo pipefail
@@ -145,6 +145,13 @@ jobs:
           sed -i '/pte_t \*pte = NULL;/a\  pte_t *ptep = NULL;' "$src"
         fi
         sed -i 's/ptep = huge_pmd_share(mm, vma, addr, pud);/if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);/' "$src"
+
+    - name: Remove mm_struct nr_ptes usage
+      working-directory: kernel
+      run: |
+        set -euo pipefail
+        file=mm/khugepaged.c
+        sed -i '/nr_ptes/d' "$file"
 
     - name: Set NR_CPUS if not present
       working-directory: kernel
