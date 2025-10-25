@@ -1,4 +1,4 @@
-name: Custom Build kernel and Wi-Fi Module
+name: Custom build kernel and Wi-Fi Module
 
 on:
   workflow_dispatch:
@@ -116,42 +116,68 @@ jobs:
           echo "$opt=n" >> "$conf"
         done
 
-    - name: Fix btrfs timespec/timespec64 incompatibility
+    - name: Fix btrfs timespec/timespec64 incompatibility (idempotent)
       working-directory: kernel
       run: |
-        set -euo pipefail
-        file=fs/btrfs/inode.c
-        if grep -q 'struct timespec now = current_time(&parent_inode->vfs_inode);' "$file"; then
-          sed -i 's|struct timespec now = current_time(&parent_inode->vfs_inode);|struct timespec64 now = current_time(&parent_inode->vfs_inode);|' "$file"
-          sed -i 's|parent_inode->vfs_inode.i_mtime = now;|parent_inode->vfs_inode.i_mtime = now;|' "$file"
-          sed -i 's|parent_inode->vfs_inode.i_ctime = now;|parent_inode->vfs_inode.i_ctime = now;|' "$file"
+        set -e
+        FILE=fs/btrfs/inode.c
+        # Only change line if the unpatched line exists
+        if grep -qE "^\s*struct timespec now = current_time\(&parent_inode->vfs_inode\);" "$FILE"; then
+          sed -i 's|^\(\s*\)struct timespec now = current_time(&parent_inode->vfs_inode);|\1struct timespec64 now = current_time(&parent_inode->vfs_inode);|' "$FILE"
+          echo "✓ Patched btrfs timespec to timespec64"
+        else
+          echo "✓ btrfs already patched or not present"
+        fi
+        # Show result for debugging
+        echo "--- btrfs/inode.c context after patch ---"
+        grep -A2 -B1 "timespec" "$FILE" || true
+
+    - name: Fix try_to_unmap argument count in huge_memory.c (idempotent)
+      working-directory: kernel
+      run: |
+        set -e
+        FILE=mm/huge_memory.c
+        if grep -q 'try_to_unmap(page, ttu_flags);' "$FILE"; then
+          sed -i 's|try_to_unmap(page, ttu_flags);|try_to_unmap(page, ttu_flags, NULL);|g' "$FILE"
+          echo "✓ Patched try_to_unmap with NULL argument"
+        else
+          echo "✓ try_to_unmap already patched or not present"
+        fi
+        echo "--- huge_memory.c context after patch ---"
+        grep -A1 -B1 "try_to_unmap" "$FILE" || true
+
+    - name: Fix hugetlbpage ptep allocation bug (idempotent)
+      working-directory: kernel
+      run: |
+        set -e
+        FILE=arch/arm64/mm/hugetlbpage.c
+        if grep -q 'pte_t \*pte = NULL;' "$FILE" && ! grep -q 'pte_t \*ptep' "$FILE"; then
+          sed -i '/pte_t \*pte = NULL;/a\  pte_t *ptep = NULL;' "$FILE"
+          echo "✓ Added ptep declaration"
+        else
+          echo "✓ ptep already declared or not needed"
+        fi
+        if grep -q 'ptep = huge_pmd_share(mm, vma, addr, pud);' "$FILE"; then
+          sed -i 's/ptep = huge_pmd_share(mm, vma, addr, pud);/if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);/' "$FILE"
+          echo "✓ Added ptep null check"
+        else
+          echo "✓ ptep null check already present"
         fi
 
-    - name: Fix try_to_unmap argument count in huge_memory.c
+    - name: Remove mm_struct nr_ptes usage (idempotent)
       working-directory: kernel
       run: |
-        set -euo pipefail
-        file=mm/huge_memory.c
-        if grep -q 'try_to_unmap(page, ttu_flags);' "$file"; then
-          sed -i 's|try_to_unmap(page, ttu_flags);|try_to_unmap(page, ttu_flags, NULL);|g' "$file"
+        set -e
+        FILE=mm/khugepaged.c
+        if grep -q 'mm->nr_ptes' "$FILE"; then
+          # Comment out lines instead of deleting to avoid syntax breaks
+          sed -i 's/\(.*mm->nr_ptes.*\)/\/\* REMOVED_for_ARM64 \1 \*\//' "$FILE"
+          echo "✓ Commented out nr_ptes references"
+        else
+          echo "✓ nr_ptes already removed or not present"
         fi
-
-    - name: Fix hugetlbpage ptep allocation bug
-      working-directory: kernel
-      run: |
-        set -euo pipefail
-        src=arch/arm64/mm/hugetlbpage.c
-        if grep -q 'pte_t \*pte = NULL;' "$src" && ! grep -q 'pte_t *ptep' "$src"; then
-          sed -i '/pte_t \*pte = NULL;/a\  pte_t *ptep = NULL;' "$src"
-        fi
-        sed -i 's/ptep = huge_pmd_share(mm, vma, addr, pud);/if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);/' "$src"
-
-    - name: Remove mm_struct nr_ptes usage
-      working-directory: kernel
-      run: |
-        set -euo pipefail
-        file=mm/khugepaged.c
-        sed -i '/nr_ptes/d' "$file"
+        echo "--- khugepaged.c nr_ptes context after patch ---"
+        grep -n "nr_ptes\|REMOVED_for_ARM64" "$FILE" || true
 
     - name: Set NR_CPUS if not present
       working-directory: kernel
