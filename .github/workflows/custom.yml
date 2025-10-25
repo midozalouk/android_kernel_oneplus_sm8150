@@ -1,4 +1,4 @@
-name: Custom build kernel and Wi-Fi Module
+name: Build kernel and Wi-Fi module
 
 on:
   workflow_dispatch:
@@ -24,7 +24,7 @@ on:
         required: true
         default: 'false'
       release_name:
-        description: 'Base name of the zip release files'
+        description: 'Release name for ZIPs'
         required: true
         default: 'OP7_KSN_wifi'
 
@@ -43,7 +43,7 @@ jobs:
       with:
         fetch-depth: 0
 
-    - name: Prepare kernel source (fresh)
+    - name: Prepare kernel source
       run: |
         set -euo pipefail
         rm -rf kernel modules || true
@@ -58,6 +58,7 @@ jobs:
           gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils make python3 libssl-dev bc bison flex unzip \
           ca-certificates xz-utils mkbootimg cpio device-tree-compiler git git-lfs zip
 
+    # KSU setup (choose KernelSU or KernelSU-Next)
     - name: Setup KernelSU or KernelSU-Next
       working-directory: kernel
       run: |
@@ -69,6 +70,7 @@ jobs:
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s stable
         fi
 
+    # SUSFS patch logic
     - name: Apply SUSFS patches if enabled
       if: ${{ github.event.inputs.enable_susfs == 'true' }}
       working-directory: kernel
@@ -90,6 +92,7 @@ jobs:
           exit 1;
         fi
 
+    # SUSFS config values
     - name: Add SUSFS configs if enabled
       if: ${{ github.event.inputs.enable_susfs == 'true' }}
       working-directory: kernel
@@ -109,7 +112,8 @@ jobs:
           echo "CONFIG_KSU_SUSFS_SUS_SU=y"
         } >> "$conf"
 
-    - name: Disable taskstats family (robust)
+    # Disable problematic configs
+    - name: Disable taskstats family
       working-directory: kernel
       run: |
         set -e
@@ -118,99 +122,67 @@ jobs:
           sed -i "/^$opt[= ]/d" "$conf" || true
           echo "${opt}=n" >> "$conf"
         done
-        tail -n 20 "$conf" || true
 
-    - name: Patch btrfs to timespec64 (idempotent, safe)
+    # btrfs timespec fix
+    - name: Patch btrfs struct timespec to struct timespec64
       working-directory: kernel
       run: |
         set -e
         file=fs/btrfs/inode.c
-        # Guard: only patch if exact unpatched line exists
         if grep -qE "^\s*struct timespec now = current_time\(&parent_inode->vfs_inode\);" "$file"; then
           sed -i 's|^\(\s*\)struct timespec now = current_time(&parent_inode->vfs_inode);|\1struct timespec64 now = current_time(&parent_inode->vfs_inode);|' "$file"
-          echo "Patched btrfs timespec -> timespec64"
-        else
-          echo "Skip btrfs timespec patch (already patched or different source)"
-        fi
-        # Sanity: ensure no corrupted line remains
-        if grep -n "struct timespec64 now = current_time(.*struct timespec" "$file"; then
-          echo "Detected corruption in btrfs timespec line"; sed -n '6615,6640p' "$file"; exit 1;
+          echo "btrfs timespec patch OK"
         fi
 
-    - name: Patch try_to_unmap arg count (idempotent)
+    # try_to_unmap argument fix
+    - name: Patch try_to_unmap arg count
       working-directory: kernel
       run: |
         set -e
         file=mm/huge_memory.c
         if grep -q 'try_to_unmap(page, ttu_flags);' "$file"; then
           sed -i 's|try_to_unmap(page, ttu_flags);|try_to_unmap(page, ttu_flags, NULL);|g' "$file"
-          echo "Patched try_to_unmap 2->3 args"
-        else
-          echo "Skip try_to_unmap patch (already correct)"
         fi
-        grep -n "try_to_unmap" "$file" || true
 
-    - name: Patch hugetlbpage ptep handling (idempotent)
+    # hugetlbpage ptep allocation fix
+    - name: Patch hugetlbpage ptep allocation
       working-directory: kernel
       run: |
         set -e
         file=arch/arm64/mm/hugetlbpage.c
-        # Add ptep declaration near top of function if missing
-        if grep -n "huge_pte_alloc" "$file" >/dev/null 2>&1; then
-          # Insert ptep declaration only if not present in function
-          if ! awk '/huge_pte_alloc/{f=1} f && /{/{print NR; exit}' "$file" | xargs -I{} sed -n '{},+80p' "$file" | grep -q "pte_t \*ptep"; then
-            line=$(awk '/huge_pte_alloc/{f=1} f && /{/{print NR; exit}' "$file")
-            if [ -n "$line" ]; then
-              # Insert after opening brace of huge_pte_alloc
-              ed -s "$file" <<'ED'
-/huge_pte_alloc/
-/{/+1
-a
-        pte_t *ptep = NULL;
-.
-w
-q
-ED
-              echo "Inserted ptep declaration in huge_pte_alloc"
-            fi
-          else
-            echo "ptep already declared in huge_pte_alloc"
+        # Add ptep declaration inside huge_pte_alloc if missing
+        awk '
+          /huge_pte_alloc/ {f=1}
+          f && /{/ {print NR; exit}
+        ' "$file" | while read ln; do
+          if ! sed -n "$((ln+1)), $((ln+20))p" "$file" | grep -q "pte_t \*ptep"; then
+            sed -i "$((ln+1)) i\    pte_t *ptep = NULL;" "$file"
           fi
-        fi
-        # Ensure guarded use of huge_pmd_share
+        done
+        # Add ptep null check for huge_pmd_share calls
         if grep -q 'ptep = huge_pmd_share(mm, vma, addr, pud);' "$file"; then
           sed -i 's/ptep = huge_pmd_share(mm, vma, addr, pud);/if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);/' "$file"
-          echo "Guarded huge_pmd_share assignment with null check"
-        else
-          echo "huge_pmd_share assignment already guarded or absent"
         fi
-        # Show context around the lines
-        grep -n "huge_pte_alloc" "$file" || true
-        grep -n "ptep = huge_pmd_share" "$file" || true
-        sed -n '220,260p' "$file" || true
 
-    - name: Comment out mm->nr_ptes usage (idempotent)
+    # Remove mm->nr_ptes usage
+    - name: Remove mm_struct nr_ptes usage
       working-directory: kernel
       run: |
         set -e
         file=mm/khugepaged.c
         if grep -q 'mm->nr_ptes' "$file"; then
           sed -i 's/\(.*mm->nr_ptes.*\)/\/\* REMOVED_for_ARM64 \1 \*\//' "$file"
-          echo "Commented mm->nr_ptes usage"
-        else
-          echo "nr_ptes usage not found (already handled)"
         fi
-        grep -n "nr_ptes\|REMOVED_for_ARM64" "$file" || true
 
-    - name: Ensure NR_CPUS
+    # NR_CPUS confirmation
+    - name: Ensure NR_CPUS config
       working-directory: kernel
       run: |
-        set -e
         conf="arch/arm64/configs/${{ github.event.inputs.defconfig_file }}"
         grep -q '^CONFIG_NR_CPUS=' "$conf" || echo 'CONFIG_NR_CPUS=8' >> "$conf"
-        tail -n 5 "$conf" || true
 
-    - name: Configure kernel (non-interactive)
+    # Kernel config generation
+    - name: Prepare kernel config
       working-directory: kernel
       run: |
         set -euo pipefail
@@ -218,6 +190,7 @@ ED
         LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make ${{ github.event.inputs.defconfig_file }}
         LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make olddefconfig
 
+    # Kernel build
     - name: Build kernel
       working-directory: kernel
       run: |
@@ -225,20 +198,21 @@ ED
         export PATH=/usr/lib/llvm-18/bin:$PATH
         LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j$(nproc)
 
+    # Image copy
     - name: Copy kernel Image.lz4 if exists
       if: always()
       run: |
         if [ -f kernel/out/android12-5.10/dist/Image.lz4 ]; then
           cp kernel/out/android12-5.10/dist/Image.lz4 kernel/AnyKernel3/Image.lz4
-        else
-          echo "Image.lz4 not found, skipping copy."
         fi
 
+    # Package ZIP
     - name: Package Kernel ZIP
       working-directory: kernel/AnyKernel3
       run: |
         zip -r ../${{ github.event.inputs.release_name }}.zip *
 
+    # Wi-Fi module build
     - name: Build Wi-Fi Module (qca_cld3)
       working-directory: kernel
       run: |
@@ -250,6 +224,7 @@ ED
         find out/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \;
         sudo chown -R $(id -u):$(id -g) ../modules
 
+    # Wi-Fi ZIP package
     - name: Package Wi-Fi Module ZIP
       run: |
         if [ ! -d "modules/vendor/lib/modules" ] || ! ls modules/vendor/lib/modules/*.ko >/dev/null 2>&1; then
@@ -259,6 +234,7 @@ ED
         cd modules
         zip -r ../${{ github.event.inputs.release_name }}-modules.zip *
 
+    # Artifact upload (build products)
     - name: Upload kernel build artifacts
       uses: actions/upload-artifact@v4
       with:
