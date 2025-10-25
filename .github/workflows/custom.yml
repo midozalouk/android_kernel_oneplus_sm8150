@@ -1,4 +1,4 @@
-name: Custiom build kernel and Wi-Fi Module
+name: Custom build kernel and Wi-Fi Module
 
 on:
   workflow_dispatch:
@@ -105,6 +105,16 @@ jobs:
         echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
         echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
         echo "CONFIG_KSU_SUSFS_SUS_SU=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
+
+    - name: Remove CONFIG_TASKSTATS and related (CI robust)
+      working-directory: kernel
+      run: |
+        set -euo pipefail
+        conf=arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
+        for opt in CONFIG_TASKSTATS CONFIG_TASK_DELAY_ACCT CONFIG_TASK_XACCT CONFIG_TASK_IO_ACCOUNTING; do
+          sed -i "/$opt/d" "$conf"
+          echo "$opt=n" >> "$conf"
+        done
 
     - name: Fix hugetlbpage ptep allocation bug
       working-directory: kernel
