@@ -102,7 +102,7 @@ EOF
         fi
         grep -E "struct timespec64|struct timespec now" fs/btrfs/inode.c | cat -n
 
-    - name: Patch try_to_unmap argument pattern
+    - name: Patch try to unmap argument pattern
       working-directory: kernel
       run: |
         set -euxo pipefail
