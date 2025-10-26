@@ -1,4 +1,4 @@
-name: Custom build kernel and Wi-Fi module
+name: Custiom build kernel and Wi-Fi module
 
 on:
   workflow_dispatch:
@@ -31,21 +31,16 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      CCACHE_HARDLINK: "true"
-      CCACHE_NOHASHDIR: "true"
-      CCACHE_MAXSIZE: "3G"
-      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
 
     steps:
-    - name: Checkout repository
+    - name: Checkout repository fresh
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
 
-    - name: Prepare kernel source
+    - name: Clean workspace & clone kernel
       run: |
-        set -euo pipefail
+        set -euxo pipefail
         rm -rf kernel modules || true
         git clone --depth=1 --branch "${{ github.event.inputs.kernel_branch }}" "${{ github.event.inputs.kernel_repo_url }}" kernel
         cd kernel
@@ -56,13 +51,12 @@ jobs:
         sudo apt-get update -y
         sudo apt-get install -y clang-18 llvm-18 lld-18 \
           gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils make python3 libssl-dev bc bison flex unzip \
-          ca-certificates xz-utils mkbootimg cpio device-tree-compiler git git-lfs zip
+          ca-certificates xz-utils mkbootimg cpio device-tree-compiler git git-lfs zip patch
 
-    # KSU setup (choose KernelSU or KernelSU-Next)
-    - name: Setup KernelSU or KernelSU-Next
+    - name: KernelSU or KernelSU-Next setup (before patching)
       working-directory: kernel
       run: |
-        set -euo pipefail
+        set -euxo pipefail
         export PATH=/usr/lib/llvm-18/bin:$PATH
         if [ "${{ github.event.inputs.use_kernelsu_next }}" = "true" ]; then
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
@@ -70,29 +64,72 @@ jobs:
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s stable
         fi
 
-    # SUSFS patch logic
     - name: Apply SUSFS patches if enabled
       if: ${{ github.event.inputs.enable_susfs == 'true' }}
       working-directory: kernel
       run: |
-        set -euo pipefail
+        set -euxo pipefail
         git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.14 susfs_patches
         cp susfs_patches/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/ || true
         cp susfs_patches/kernel_patches/50_add_susfs_in_kernel-4.14.patch . || true
         cp -r susfs_patches/kernel_patches/fs/* ./fs/ || true
         cp -r susfs_patches/kernel_patches/include/linux/* ./include/linux/ || true
         if [ -f KernelSU/10_enable_susfs_for_ksu.patch ]; then
-          (cd KernelSU && patch -N -p1 -F3 < 10_enable_susfs_for_ksu.patch) || echo "KernelSU SUSFS patch already applied"
+          (cd KernelSU && patch -N -p1 < 10_enable_susfs_for_ksu.patch)
         fi
         if [ -f 50_add_susfs_in_kernel-4.14.patch ]; then
-          patch -N -p1 -F3 < 50_add_susfs_in_kernel-4.14.patch || echo "Kernel core SUSFS patch already applied"
+          patch -N -p1 < 50_add_susfs_in_kernel-4.14.patch
         fi
         if find . -name "*.rej" | grep -q .; then
-          echo "SUSFS patch rejects found:"; find . -name "*.rej" -print -exec sed -n '1,120p' {} \;;
+          echo "SUSFS patch rejects found:"; find . -name "*.rej" -print -exec sed -n '1,20p' {} \;;
           exit 1;
         fi
 
-    # SUSFS config values
+    - name: Patch btrfs struct timespec64 with diff (idempotent & atomic)
+      working-directory: kernel
+      run: |
+        set -euxo pipefail
+        PATCH_FILE=btrfs_timespec64.patch
+        cat <<EOF > $PATCH_FILE
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ ... @@
+-                struct timespec now = current_time(&parent_inode->vfs_inode);
++                struct timespec64 now = current_time(&parent_inode->vfs_inode);
+EOF
+        if grep -Fq "struct timespec now = current_time(&parent_inode->vfs_inode);" fs/btrfs/inode.c; then
+          patch -p1 < $PATCH_FILE
+        fi
+        grep -E "struct timespec64|struct timespec now" fs/btrfs/inode.c | cat -n
+
+    - name: Patch try_to_unmap argument pattern
+      working-directory: kernel
+      run: |
+        set -euxo pipefail
+        sed -i 's|try_to_unmap(page, ttu_flags);|try_to_unmap(page, ttu_flags, NULL);|g' mm/huge_memory.c
+        grep -C2 "try_to_unmap" mm/huge_memory.c | cat -n
+
+    - name: Patch hugetlbpage ptep allocation (safe/atomic)
+      working-directory: kernel
+      run: |
+        set -euxo pipefail
+        file=arch/arm64/mm/hugetlbpage.c
+        awk '/huge_pte_alloc/{f=1} f && /{/{print NR; exit}' $file | while read ln; do
+          if ! sed -n "$((ln+1)), $((ln+15))p" $file | grep -q "pte_t *ptep"; then
+            sed -i "$((ln+1)) i\    pte_t *ptep = NULL;" $file
+          fi
+        done
+        sed -i 's/ptep = huge_pmd_share(mm, vma, addr, pud);/if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);/' $file
+        grep -n "pte_t *ptep" $file | cat -n
+        grep -C4 "ptep = huge_pmd_share" $file | cat -n
+
+    - name: Remove mm->nr_ptes usage (safe/atomic)
+      working-directory: kernel
+      run: |
+        set -euxo pipefail
+        sed -i 's/\(.*mm->nr_ptes.*\)/\/\* REMOVED_for_ARM64 \1 \*\//' mm/khugepaged.c
+        grep -C2 "nr_ptes" mm/khugepaged.c | cat -n || true
+
     - name: Add SUSFS configs if enabled
       if: ${{ github.event.inputs.enable_susfs == 'true' }}
       working-directory: kernel
@@ -112,93 +149,39 @@ jobs:
           echo "CONFIG_KSU_SUSFS_SUS_SU=y"
         } >> "$conf"
 
-    # Disable problematic configs
-    - name: Disable taskstats family
+    - name: Disable problematic configs
       working-directory: kernel
       run: |
-        set -e
+        set -euxo pipefail
         conf="arch/arm64/configs/${{ github.event.inputs.defconfig_file }}"
         for opt in CONFIG_TASKSTATS CONFIG_TASK_DELAY_ACCT CONFIG_TASK_XACCT CONFIG_TASK_IO_ACCOUNTING; do
           sed -i "/^$opt[= ]/d" "$conf" || true
           echo "${opt}=n" >> "$conf"
         done
+        tail -n 10 "$conf"
 
-    # btrfs timespec fix
-    - name: Patch btrfs struct timespec to struct timespec64
-      working-directory: kernel
-      run: |
-        set -e
-        file=fs/btrfs/inode.c
-        if grep -qE "^\s*struct timespec now = current_time\(&parent_inode->vfs_inode\);" "$file"; then
-          sed -i 's|^\(\s*\)struct timespec now = current_time(&parent_inode->vfs_inode);|\1struct timespec64 now = current_time(&parent_inode->vfs_inode);|' "$file"
-          echo "btrfs timespec patch OK"
-        fi
-
-    # try_to_unmap argument fix
-    - name: Patch try_to_unmap arg count
-      working-directory: kernel
-      run: |
-        set -e
-        file=mm/huge_memory.c
-        if grep -q 'try_to_unmap(page, ttu_flags);' "$file"; then
-          sed -i 's|try_to_unmap(page, ttu_flags);|try_to_unmap(page, ttu_flags, NULL);|g' "$file"
-        fi
-
-    # hugetlbpage ptep allocation fix
-    - name: Patch hugetlbpage ptep allocation
-      working-directory: kernel
-      run: |
-        set -e
-        file=arch/arm64/mm/hugetlbpage.c
-        # Add ptep declaration inside huge_pte_alloc if missing
-        awk '
-          /huge_pte_alloc/ {f=1}
-          f && /{/ {print NR; exit}
-        ' "$file" | while read ln; do
-          if ! sed -n "$((ln+1)), $((ln+20))p" "$file" | grep -q "pte_t \*ptep"; then
-            sed -i "$((ln+1)) i\    pte_t *ptep = NULL;" "$file"
-          fi
-        done
-        # Add ptep null check for huge_pmd_share calls
-        if grep -q 'ptep = huge_pmd_share(mm, vma, addr, pud);' "$file"; then
-          sed -i 's/ptep = huge_pmd_share(mm, vma, addr, pud);/if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);/' "$file"
-        fi
-
-    # Remove mm->nr_ptes usage
-    - name: Remove mm_struct nr_ptes usage
-      working-directory: kernel
-      run: |
-        set -e
-        file=mm/khugepaged.c
-        if grep -q 'mm->nr_ptes' "$file"; then
-          sed -i 's/\(.*mm->nr_ptes.*\)/\/\* REMOVED_for_ARM64 \1 \*\//' "$file"
-        fi
-
-    # NR_CPUS confirmation
     - name: Ensure NR_CPUS config
       working-directory: kernel
       run: |
-        conf="arch/arm64/configs/${{ github.event.inputs.defconfig_file }}"
-        grep -q '^CONFIG_NR_CPUS=' "$conf" || echo 'CONFIG_NR_CPUS=8' >> "$conf"
+        grep -q '^CONFIG_NR_CPUS=' arch/arm64/configs/${{ github.event.inputs.defconfig_file }} || echo 'CONFIG_NR_CPUS=8' >> arch/arm64/configs/${{ github.event.inputs.defconfig_file }}
 
-    # Kernel config generation
     - name: Prepare kernel config
       working-directory: kernel
       run: |
-        set -euo pipefail
+        set -euxo pipefail
         export PATH=/usr/lib/llvm-18/bin:$PATH
+        make mrproper
         LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make ${{ github.event.inputs.defconfig_file }}
         LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make olddefconfig
+        grep 'CONFIG_NR_CPUS=' .config
 
-    # Kernel build
     - name: Build kernel
       working-directory: kernel
       run: |
-        set -euo pipefail
+        set -euxo pipefail
         export PATH=/usr/lib/llvm-18/bin:$PATH
         LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j$(nproc)
 
-    # Image copy
     - name: Copy kernel Image.lz4 if exists
       if: always()
       run: |
@@ -206,17 +189,15 @@ jobs:
           cp kernel/out/android12-5.10/dist/Image.lz4 kernel/AnyKernel3/Image.lz4
         fi
 
-    # Package ZIP
     - name: Package Kernel ZIP
       working-directory: kernel/AnyKernel3
       run: |
         zip -r ../${{ github.event.inputs.release_name }}.zip *
 
-    # Wi-Fi module build
     - name: Build Wi-Fi Module (qca_cld3)
       working-directory: kernel
       run: |
-        set -euo pipefail
+        set -euxo pipefail
         export PATH=/usr/lib/llvm-18/bin:$PATH
         LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make modules_prepare
         LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j$(nproc) -C drivers/staging/qcacld-3.0 M=$(pwd)/drivers/staging/qcacld-3.0 modules
@@ -224,7 +205,6 @@ jobs:
         find out/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \;
         sudo chown -R $(id -u):$(id -g) ../modules
 
-    # Wi-Fi ZIP package
     - name: Package Wi-Fi Module ZIP
       run: |
         if [ ! -d "modules/vendor/lib/modules" ] || ! ls modules/vendor/lib/modules/*.ko >/dev/null 2>&1; then
@@ -234,7 +214,6 @@ jobs:
         cd modules
         zip -r ../${{ github.event.inputs.release_name }}-modules.zip *
 
-    # Artifact upload (build products)
     - name: Upload kernel build artifacts
       uses: actions/upload-artifact@v4
       with:
