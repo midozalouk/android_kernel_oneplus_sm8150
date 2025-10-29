@@ -1,4 +1,4 @@
-name: Custom build kernel and Wi-Fi module
+name: Custom Build kernel and Wi-Fi module
 
 on:
   workflow_dispatch:
@@ -38,13 +38,20 @@ jobs:
       with:
         fetch-depth: 0
 
-    - name: Install full build dependencies (from ravindu644 tutorial)
+    - name: Install full build dependencies (including cross-toolchain)
       run: |
         sudo apt-get update -y
         sudo apt-get install -y git device-tree-compiler lz4 xz-utils zlib1g-dev openjdk-17-jdk gcc g++ python3 python-is-python3 p7zip-full android-sdk-libsparse-utils erofs-utils \
           default-jdk git gnupg flex bison gperf build-essential zip curl libc6-dev libncurses-dev libx11-dev libreadline-dev libgl1 libgl1-mesa-dev \
           python3 make sudo gcc g++ bc grep tofrodos python3-markdown libxml2-utils xsltproc libtinfo6 \
           make repo cpio kmod openssl libelf-dev pahole libssl-dev libarchive-tools zstd rsync --fix-missing
+        sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+    - name: Verify cross-compiler binaries
+      run: |
+        aarch64-linux-gnu-gcc --version
+        which aarch64-linux-gnu-ld
+        aarch64-linux-gnu-ld --version
 
     - name: Clean workspace & clone kernel
       run: |
@@ -52,7 +59,6 @@ jobs:
         git clone --depth=1 --branch "${{ github.event.inputs.kernel_branch }}" "${{ github.event.inputs.kernel_repo_url }}" kernel
         cd kernel
         git submodule update --init --recursive
-        # Fix permissions as per tutorial to avoid patch errors
         chmod +755 -R .
 
     - name: Setup KernelSU or KernelSU-Next
