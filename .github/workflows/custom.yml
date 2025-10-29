@@ -1,4 +1,4 @@
-name: Custom Build kernel and Wi-Fi module
+name: Custom build kernel and Wi-Fi module
 
 on:
   workflow_dispatch:
@@ -38,25 +38,26 @@ jobs:
       with:
         fetch-depth: 0
 
+    - name: Install full build dependencies (from ravindu644 tutorial)
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y git device-tree-compiler lz4 xz-utils zlib1g-dev openjdk-17-jdk gcc g++ python3 python-is-python3 p7zip-full android-sdk-libsparse-utils erofs-utils \
+          default-jdk git gnupg flex bison gperf build-essential zip curl libc6-dev libncurses-dev libx11-dev libreadline-dev libgl1 libgl1-mesa-dev \
+          python3 make sudo gcc g++ bc grep tofrodos python3-markdown libxml2-utils xsltproc libtinfo6 \
+          make repo cpio kmod openssl libelf-dev pahole libssl-dev libarchive-tools zstd rsync --fix-missing
+
     - name: Clean workspace & clone kernel
       run: |
-        set -euxo pipefail
         rm -rf kernel modules || true
         git clone --depth=1 --branch "${{ github.event.inputs.kernel_branch }}" "${{ github.event.inputs.kernel_repo_url }}" kernel
         cd kernel
         git submodule update --init --recursive
+        # Fix permissions as per tutorial to avoid patch errors
+        chmod +755 -R .
 
-    - name: Setup dependencies
-      run: |
-        sudo apt-get update -y
-        sudo apt-get install -y clang-18 llvm-18 lld-18 \
-          gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils make python3 libssl-dev bc bison flex unzip \
-          ca-certificates xz-utils mkbootimg cpio device-tree-compiler git git-lfs zip patch
-
-    - name: KernelSU or KernelSU-Next setup (before patching)
+    - name: Setup KernelSU or KernelSU-Next
       working-directory: kernel
       run: |
-        set -euxo pipefail
         export PATH=/usr/lib/llvm-18/bin:$PATH
         if [ "${{ github.event.inputs.use_kernelsu_next }}" = "true" ]; then
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
@@ -68,7 +69,6 @@ jobs:
       if: ${{ github.event.inputs.enable_susfs == 'true' }}
       working-directory: kernel
       run: |
-        set -euxo pipefail
         git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.14 susfs_patches
         cp susfs_patches/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/ || true
         cp susfs_patches/kernel_patches/50_add_susfs_in_kernel-4.14.patch . || true
@@ -88,7 +88,6 @@ jobs:
     - name: Patch btrfs struct timespec64 (idempotent sed)
       working-directory: kernel
       run: |
-        set -euxo pipefail
         file=fs/btrfs/inode.c
         orig='struct timespec now = current_time(&parent_inode->vfs_inode);'
         repl='struct timespec64 now = current_time(&parent_inode->vfs_inode);'
@@ -98,28 +97,29 @@ jobs:
     - name: Patch try_to_unmap argument pattern
       working-directory: kernel
       run: |
-        set -euxo pipefail
         sed -i 's|try_to_unmap(page, ttu_flags);|try_to_unmap(page, ttu_flags, NULL);|g' mm/huge_memory.c
         grep -C2 "try_to_unmap" mm/huge_memory.c | cat -n
 
-    - name: Patch hugetlbpage ptep allocation (safe/atomic)
+    - name: Patch hugetlbpage ptep allocation (safe/atomic, non-fatal)
       working-directory: kernel
       run: |
-        set -euxo pipefail
         file=arch/arm64/mm/hugetlbpage.c
-        awk '/huge_pte_alloc/{f=1} f && /{/{print NR; exit}' $file | while read ln; do
-          if ! sed -n "$((ln+1)), $((ln+15))p" $file | grep -q "pte_t *ptep"; then
+        ln=$(awk '/huge_pte_alloc/{f=1} f && /{/{print NR; exit}' $file)
+        if [ -n "$ln" ]; then
+          if ! sed -n "$((ln+1)),$((ln+15))p" $file | grep -q "pte_t *ptep"; then
             sed -i "$((ln+1)) i\    pte_t *ptep = NULL;" $file
+            echo "Inserted 'pte_t *ptep = NULL;' after line $ln"
           fi
-        done
-        sed -i 's/ptep = huge_pmd_share(mm, vma, addr, pud);/if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);/' $file
-        grep -n "pte_t *ptep" $file | cat -n
-        grep -C4 "ptep = huge_pmd_share" $file | cat -n
+          sed -i 's/ptep = huge_pmd_share(mm, vma, addr, pud);/if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);/' $file
+        else
+          echo "huge_pte_alloc function not found, skipping ptep patch"
+        fi
+        grep -n "pte_t *ptep" $file | cat -n || true
+        grep -C4 "ptep = huge_pmd_share" $file | cat -n || true
 
     - name: Remove mm->nr_ptes usage (safe/atomic)
       working-directory: kernel
       run: |
-        set -euxo pipefail
         sed -i 's/\(.*mm->nr_ptes.*\)/\/\* REMOVED_for_ARM64 \1 \*\//' mm/khugepaged.c
         grep -C2 "nr_ptes" mm/khugepaged.c | cat -n || true
 
@@ -145,7 +145,6 @@ jobs:
     - name: Disable problematic configs
       working-directory: kernel
       run: |
-        set -euxo pipefail
         conf="arch/arm64/configs/${{ github.event.inputs.defconfig_file }}"
         for opt in CONFIG_TASKSTATS CONFIG_TASK_DELAY_ACCT CONFIG_TASK_XACCT CONFIG_TASK_IO_ACCOUNTING; do
           sed -i "/^$opt[= ]/d" "$conf" || true
@@ -161,7 +160,6 @@ jobs:
     - name: Prepare kernel config
       working-directory: kernel
       run: |
-        set -euxo pipefail
         export PATH=/usr/lib/llvm-18/bin:$PATH
         make mrproper
         LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make ${{ github.event.inputs.defconfig_file }}
@@ -171,7 +169,6 @@ jobs:
     - name: Build kernel
       working-directory: kernel
       run: |
-        set -euxo pipefail
         export PATH=/usr/lib/llvm-18/bin:$PATH
         LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j$(nproc)
 
@@ -190,7 +187,6 @@ jobs:
     - name: Build Wi-Fi Module (qca_cld3)
       working-directory: kernel
       run: |
-        set -euxo pipefail
         export PATH=/usr/lib/llvm-18/bin:$PATH
         LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make modules_prepare
         LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j$(nproc) -C drivers/staging/qcacld-3.0 M=$(pwd)/drivers/staging/qcacld-3.0 modules
