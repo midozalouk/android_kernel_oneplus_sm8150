@@ -113,7 +113,7 @@ EOF
       working-directory: kernel
       run: |
         sed -i 's|try_to_unmap(page, ttu_flags);|try_to_unmap(page, ttu_flags, NULL);|g' mm/huge_memory.c
-        grep -C2 "try_to_unmap" mm/huge_memory.c | cat -n || true
+        grep -C2 "try_to_unmap" mm/huge_memory.c | cat -n
 
     - name: Patch hugetlbpage ptep allocation (safe/atomic, non-fatal)
       working-directory: kernel
@@ -190,39 +190,57 @@ EOF
     - name: Copy kernel Image.lz4 if exists
       if: always()
       run: |
-        if [ -f kernel/out/android12-5.10/dist/Image.lz4 ]; then
-          cp kernel/out/android12-5.10/dist/Image.lz4 kernel/AnyKernel3/Image.lz4
+        if [ -f kernel/out/arch/arm64/boot/Image.lz4 ]; then
+          mkdir -p kernel/AnyKernel3
+          cp kernel/out/arch/arm64/boot/Image.lz4 kernel/AnyKernel3/Image.lz4
+        elif [ -f kernel/out/arch/arm64/boot/Image.gz ]; then
+          mkdir -p kernel/AnyKernel3
+          cp kernel/out/arch/arm64/boot/Image.gz kernel/AnyKernel3/Image.gz
+        else
+          echo "No kernel image found"
+          exit 1
         fi
 
     - name: Package Kernel ZIP
       working-directory: kernel/AnyKernel3
       run: |
-        zip -r ../${{ github.event.inputs.release_name }}.zip *
+        if [ ! -d "AnyKernel3" ]; then
+          echo "AnyKernel3 directory not found, creating basic structure"
+          mkdir -p AnyKernel3
+          echo "do DEVICE_NAME=OnePlus 7" > AnyKernel3/anykernel.sh
+          echo "do CLEANUP=0" >> AnyKernel3/anykernel.sh
+        fi
+        zip -r ../${{ github.event.inputs.release_name }}.zip * -x .git README.md *placeholder
 
     - name: Build Wi-Fi Module (qca_cld3)
       working-directory: kernel
       run: |
         export PATH=/usr/lib/llvm-18/bin:$PATH
         LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make modules_prepare
-        LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j$(nproc) -C drivers/staging/qcacld-3.0 M=$(pwd)/drivers/staging/qcacld-3.0 modules
+        LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j$(nproc) M=drivers/staging/qcacld-3.0 modules
         mkdir -p ../modules/vendor/lib/modules
-        find out/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \;
+        find drivers/staging/qcacld-3.0 -name "*.ko" -exec cp {} ../modules/vendor/lib/modules/ \;
+        if [ -z "$(ls -A ../modules/vendor/lib/modules)" ]; then
+          echo "No Wi-Fi modules built"
+          exit 1
+        fi
         sudo chown -R $(id -u):$(id -g) ../modules
 
     - name: Package Wi-Fi Module ZIP
       run: |
-        if [ ! -d "modules/vendor/lib/modules" ] || ! ls modules/vendor/lib/modules/*.ko >/dev/null 2>&1; then
-          echo "No Wi-Fi modules to package, exiting."
-          exit 1
+        if [ ! -d "modules/vendor/lib/modules" ] || [ -z "$(ls modules/vendor/lib/modules/*.ko 2>/dev/null)" ]; then
+          echo "No Wi-Fi modules to package, skipping ZIP creation"
+        else
+          cd modules
+          zip -r ../${{ github.event.inputs.release_name }}-modules.zip vendor
         fi
-        cd modules
-        zip -r ../${{ github.event.inputs.release_name }}-modules.zip *
 
     - name: Upload kernel build artifacts
       uses: actions/upload-artifact@v4
       with:
         name: kernel-output
         path: kernel/out
+        if-no-files-found: ignore
 
     - name: Upload zips
       uses: actions/upload-artifact@v4
@@ -231,3 +249,4 @@ EOF
         path: |
           kernel/${{ github.event.inputs.release_name }}.zip
           ${{ github.event.inputs.release_name }}-modules.zip
+        if-no-files-found: ignore
