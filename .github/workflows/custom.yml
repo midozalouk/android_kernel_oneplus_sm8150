@@ -106,7 +106,7 @@ jobs:
 @@ -6627,7 +6627,7 @@
 -                struct timespec now = current_time(&parent_inode->vfs_inode);
 +                struct timespec64 now = current_time(&parent_inode->vfs_inode);
-+EOF
+EOF
           if grep -qF "struct timespec now = current_time(&parent_inode->vfs_inode);" fs/btrfs/inode.c; then
             patch -p1 < $patchfile
           else
