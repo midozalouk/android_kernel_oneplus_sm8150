@@ -1,232 +1,442 @@
-name: Custom Build kernel and Wi-Fi module
+name: Build kernel (KSN) & WIFI A16
 
 on:
   workflow_dispatch:
     inputs:
-      kernel_repo_url:
-        description: 'Kernel repository URL'
+      kernel_source_url:
+        description: "URL of the kernel source repository"
         required: true
-        default: 'https://github.com/LineageOS/android_kernel_oneplus_sm8150'
+        default: "https://github.com/LineageOS/android_kernel_oneplus_sm8150"
       kernel_branch:
-        description: 'Kernel branch'
+        description: "Branch of the kernel source"
         required: true
-        default: 'lineage-22.1'
-      defconfig_file:
-        description: 'Kernel defconfig filename'
+        default: "lineage-22.1"
+      kernel_defconfig:
+        description: "defconfig file to use"
         required: true
-        default: 'lineage_sm8150_defconfig'
-      use_kernelsu_next:
-        description: 'Use KernelSU-Next instead of KernelSU'
-        required: true
-        default: 'false'
-      enable_susfs:
-        description: 'Enable SUSFS patches'
-        required: true
-        default: 'false'
-      release_name:
-        description: 'Release name for ZIPs'
-        required: true
-        default: 'OP7_KSN_wifi'
+        default: "lineage_sm8150_defconfig"
+      output_name:
+        description: "Name of the output.zip"
+        required: false
+        default: "OP7_KSN_wifi"
+  push:
+    branches:
+      - oneplus/OOS_SM8150_11.0
+  pull_request:
+    branches:
+      - oneplus/OOS_SM8150_11.0
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_MAXSIZE: "2G"
+      CCACHE_HARDLINK: "true"
+      KERNEL_CMDLINE: "ARCH=arm64 LLVM=1 LLVM_IAS=1 O=out CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu-"
+      KERNEL_DEFCONFIG: ${{ github.event.inputs.kernel_defconfig || 'lineage_sm8150_defconfig' }}
+      KERNEL_SOURCE_URL: ${{ github.event.inputs.kernel_source_url || 'https://github.com/LineageOS/android_kernel_oneplus_sm8150' }}
+      KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch || 'lineage-22.1' }}
+      OUTPUT_ZIP_NAME: ${{ github.event.inputs.output_name || 'OP7_KSN_wifi' }}
 
     steps:
-    - name: Checkout repository fresh
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Install full build dependencies (including cross-toolchain)
-      run: |
-        sudo apt-get update -y
-        sudo apt-get install -y git device-tree-compiler lz4 xz-utils zlib1g-dev openjdk-17-jdk gcc g++ python3 python-is-python3 p7zip-full android-sdk-libsparse-utils erofs-utils default-jdk git gnupg flex bison gperf build-essential zip curl libc6-dev libncurses-dev libx11-dev libreadline-dev libgl1 libgl1-mesa-dev python3 make sudo gcc g++ bc grep tofrodos python3-markdown libxml2-utils xsltproc libtinfo6 make repo cpio kmod openssl libelf-dev pahole libssl-dev libarchive-tools zstd rsync --fix-missing
-        sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+      - name: Checkout Kernel Source
+        run: |
+          set -euo pipefail
+          git clone --depth=1 --branch "${KERNEL_BRANCH}" "${KERNEL_SOURCE_URL}" kernel
+          cd kernel
+          git submodule update --init --recursive
+          cd ..
 
-    - name: Verify cross-compiler binaries
-      run: |
-        aarch64-linux-gnu-gcc --version
-        which aarch64-linux-gnu-ld
-        aarch64-linux-gnu-ld --version
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
 
-    - name: Clean workspace & clone kernel
-      run: |
-        rm -rf kernel modules || true
-        git clone --depth=1 --branch "${{ github.event.inputs.kernel_branch }}" "${{ github.event.inputs.kernel_repo_url }}" kernel
-        cd kernel
-        git submodule update --init --recursive
-        chmod +755 -R .
+      - name: Cleanup space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf "/usr/local/share/boost" || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
 
-    - name: Setup KernelSU or KernelSU-Next
-      working-directory: kernel
-      run: |
-        export PATH=/usr/lib/llvm-18/bin:$PATH
-        if [ "${{ github.event.inputs.use_kernelsu_next }}" = "true" ]; then
+      - name: Install dependencies (LLVM 18 + cross-binutils)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            clang-18 llvm-18 lld-18 \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            binutils-aarch64-linux-gnu binutils \
+            make python3 libssl-dev build-essential bc bison flex unzip \
+            ca-certificates xz-utils mkbootimg cpio device-tree-compiler git git-lfs
+          git clone https://github.com/khalidaboelmagd/AnyKernel3
+          rm -rf AnyKernel3/.git
+
+      - name: Get Version
+        id: get_version
+        run: |
+          set -euo pipefail
+          cd kernel
+          git fetch --unshallow || true
+          COUNT="$(git rev-list --count HEAD || echo 0)"
+          echo "VERSION=$((COUNT + 10200))" >> "$GITHUB_OUTPUT"
+          cd ..
+
+      - name: KernelSU-Next setup
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          export PATH="/usr/lib/llvm-18/bin:$PATH"
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
-        else
-          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s stable
-        fi
 
-    - name: Apply SUSFS patches if enabled
-      if: github.event.inputs.enable_susfs == 'true'
-      working-directory: kernel
-      run: |
-        git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.14 susfs_patches
-        cp susfs_patches/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/ || true
-        cp susfs_patches/kernel_patches/50_add_susfs_in_kernel-4.14.patch . || true
-        cp -r susfs_patches/kernel_patches/fs/* ./fs/ || true
-        cp -r susfs_patches/kernel_patches/include/linux/* ./include/linux/ || true
-        if [ -f KernelSU/10_enable_susfs_for_ksu.patch ]; then
-          (cd KernelSU && patch -N -p1 < 10_enable_susfs_for_ksu.patch)
-        fi
-        if [ -f 50_add_susfs_in_kernel-4.14.patch ]; then
-          patch -N -p1 < 50_add_susfs_in_kernel-4.14.patch
-        fi
-        if find . -name "*.rej" | grep -q .; then
-          echo "SUSFS patch rejects found:"
-          find . -name "*.rej" -print -exec sed -n '1,20p' {} \;
-          exit 1
-        fi
-
-    - name: Patch btrfs struct timespec64 using patch file
-      working-directory: kernel
-      run: |
-        patchfile="btrfs_timespec64.patch"
-        cat > "$patchfile" <<'EOF'
---- a/fs/btrfs/inode.c
-+++ b/fs/btrfs/inode.c
-@@ -6627,7 +6627,7 @@
--                struct timespec now = current_time(&parent_inode->vfs_inode);
-+                struct timespec64 now = current_time(&parent_inode->vfs_inode);
-EOF
-        if grep -qF "struct timespec now = current_time(&parent_inode->vfs_inode);" fs/btrfs/inode.c; then
-          patch -p1 < "$patchfile" || (echo "Patch failed or already applied"; exit 1)
-        else
-          echo "Patch already applied or no match"
-        fi
-        sed -n '6620,6640p' fs/btrfs/inode.c | tail -20
-
-    - name: Patch try_to_unmap argument pattern
-      working-directory: kernel
-      run: |
-        sed -i 's@try_to_unmap(page, ttu_flags);@try_to_unmap(page, ttu_flags, NULL);@g' mm/huge_memory.c
-        grep -C2 "try_to_unmap" mm/huge_memory.c | cat -n
-
-    - name: Patch hugetlbpage ptep allocation (safe/atomic, non-fatal)
-      working-directory: kernel
-      run: |
-        file=arch/arm64/mm/hugetlbpage.c
-        ln=$(awk '/huge_pte_alloc/{f=1} f && /{/{print NR; exit}' "$file")
-        if [ -n "$ln" ]; then
-          if ! sed -n "$((ln+1)),$((ln+15))p" "$file" | grep -q "pte_t \*ptep"; then
-            sed -i "$((ln+1)) i\    pte_t *ptep = NULL;" "$file"
-            echo "Inserted 'pte_t *ptep = NULL;' after line $ln"
+      # MM fixes for hugetlb/THP
+      - name: Apply hugetlbpage fix patch
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          if ! grep -q 'pte_t \*ptep' arch/arm64/mm/hugetlbpage.c; then
+            sed -i '/pte_t \*pte = NULL;/a \  pte_t *ptep = NULL;' arch/arm64/mm/hugetlbpage.c || true
           fi
-          sed -i 's@ptep = huge_pmd_share(mm, vma, addr, pud);@if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);@' "$file"
-        else
-          echo "huge_pte_alloc function not found, skipping ptep patch"
-        fi
-        grep -n "pte_t \*ptep" "$file" | cat -n || true
-        grep -C4 "ptep = huge_pmd_share" "$file" | cat -n || true
+          sed -i 's/ptep = huge_pmd_share(mm, vma, addr, pud);/if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);/' arch/arm64/mm/hugetlbpage.c
 
-    - name: Remove mm->nr_ptes usage (safe/atomic)
-      working-directory: kernel
-      run: |
-        sed -i 's@\(.*mm->nr_ptes.*\)@/* REMOVED_for_ARM64 \1 */@' mm/khugepaged.c
-        grep -C2 "nr_ptes" mm/khugepaged.c | cat -n || true
+      - name: Apply huge_memory try_to_unmap shim
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          sed -i 's/try_to_unmap(page, ttu_flags);/try_to_unmap(page, ttu_flags, NULL);/g' mm/huge_memory.c 2>/dev/null || true
+          sed -i 's/try_to_unmap(\s*page\s*,\s*ttu_flags\s*)/try_to_unmap(page, ttu_flags, NULL)/g' mm/huge_memory.c 2>/dev/null || true
 
-    - name: Add SUSFS configs if enabled
-      if: github.event.inputs.enable_susfs == 'true'
-      working-directory: kernel
-      run: |
-        conf="arch/arm64/configs/${{ github.event.inputs.defconfig_file }}"
-        cat >> "$conf" <<'EOF'
-CONFIG_KSU=y
-CONFIG_KSU_SUSFS=y
-CONFIG_KSU_SUSFS_SUS_PATH=y
-CONFIG_KSU_SUSFS_SUS_MOUNT=y
-CONFIG_KSU_SUSFS_SUS_KSTAT=y
-CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
-CONFIG_KSU_SUSFS_TRY_UMOUNT=y
-CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-CONFIG_KSU_SUSFS_ENABLE_LOG=y
-CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-CONFIG_KSU_SUSFS_SUS_SU=y
-EOF
+      - name: Fix split_huge_pmd call order
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          sed -Ei 's/split_huge_pmd\(([[:space:]]*)vma([[:space:]]*),([[:space:]]*)addr([[:space:]]*),([[:space:]]*)pmd([[:space:]]*)\);/split_huge_pmd(vma, pmd, addr);/g' fs/proc/task_mmu.c || true
 
-    - name: Disable problematic configs
-      working-directory: kernel
-      run: |
-        conf="arch/arm64/configs/${{ github.event.inputs.defconfig_file }}"
-        for opt in CONFIG_TASKSTATS CONFIG_TASK_DELAY_ACCT CONFIG_TASK_XACCT CONFIG_TASK_IO_ACCOUNTING; do
-          sed -i "/^$opt[= ]/d" "$conf" || true
-          echo "${opt}=n" >> "$conf"
-        done
-        tail -n 10 "$conf"
+      - name: Neutralize mm->nr_ptes in khugepaged
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          sed -i 's/atomic_long_dec(&mm->nr_ptes);/\/\* compat: mm->nr_ptes removed \*\/ do {} while (0);/' mm/khugepaged.c || true
 
-    - name: Ensure NR_CPUS config
-      working-directory: kernel
-      run: |
-        conf="arch/arm64/configs/${{ github.event.inputs.defconfig_file }}"
-        grep -q '^CONFIG_NR_CPUS=' "$conf" || echo 'CONFIG_NR_CPUS=8' >> "$conf"
+      # Blackhole unwanted Kbuild and Makefile in important directories
+      - name: Hard-blackhole unwanted Kbuild subtrees (CLK and NET)
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          disable_dir() {
+            local d="$1"
+            if [ -d "$d" ]; then
+              if [ -f "$d/Makefile" ]; then
+                mv -f "$d/Makefile" "$d/Makefile.bak" || true
+              fi
+              if [ -f "$d/Kbuild" ]; then
+                mv -f "$d/Kbuild" "$d/Kbuild.bak" || true
+              fi
+              echo -e '# disabled in CI for sm8150\nobj-y :=\nobj-m :=' > "$d/Makefile"
+              chmod 644 "$d/Makefile"
+              echo "[CI] Blackholed $d"
+            else
+              echo "[CI WARNING] Directory $d not found"
+            fi
+          }
+          disable_dir drivers/clk/bcm
+          disable_dir drivers/clk/berlin
+          disable_dir drivers/clk/hisilicon
+          disable_dir net/ipv6
+          disable_dir net/bridge
+          disable_dir net/8021q
+          disable_dir net/bluetooth
+          disable_dir net/9p
+          disable_dir net/netfilter
+          disable_dir net/mac80211
+          disable_dir net/llc
 
-    - name: Prepare kernel config
-      working-directory: kernel
-      run: |
-        export PATH=/usr/lib/llvm-18/bin:$PATH
-        make mrproper
-        LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make ${{ github.event.inputs.defconfig_file }}
-        LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make olddefconfig
-        grep 'CONFIG_NR_CPUS=' .config
+      - name: Defensive seg6 header shim (IPv6 off)
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          hdr="include/net/seg6.h"
+          if [ -f "$hdr" ] && grep -q 'return net->ipv6.seg6_data;' "$hdr"; then
+            sed -i 's|return net->ipv6.seg6_data;|#ifdef CONFIG_IPV6\nreturn net->ipv6.seg6_data;\n#else\nreturn NULL;\n#endif|' "$hdr"
+            echo "[CI] Patched $hdr to tolerate CONFIG_IPV6=n"
+          fi
+          if [ -f net/core/filter.c ] && grep -q '^#include <net/seg6.h>' net/core/filter.c; then
+            sed -i 's|#include <net/seg6.h>|#if IS_ENABLED(CONFIG_IPV6_SEG6_BPF)\n#include <net/seg6.h>\n#endif|' net/core/filter.c
+          fi
 
-    - name: Build kernel
-      working-directory: kernel
-      run: |
-        export PATH=/usr/lib/llvm-18/bin:$PATH
-        LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j$(nproc)
+      # Filter NFS/LOCKD/SUNRPC from fs
+      - name: Filter NFS/LOCKD/SUNRPC from fs/Makefile
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          if ! grep -q 'CI filter: prevent NFS' fs/Makefile; then
+            {
+              echo ''
+              echo '# CI filter: prevent NFS/LOCKD/SUNRPC from building regardless of Kconfig'
+              echo 'subdir-y := $(filter-out nfs lockd nfs_common sunrpc,$(subdir-y))'
+              echo 'subdir-m := $(filter-out nfs lockd nfs_common sunrpc,$(subdir-m))'
+            } >> fs/Makefile
+          fi
 
-    - name: Copy kernel Image.lz4 if exists
-      if: always()
-      run: |
-        if [ -f kernel/out/android12-5.10/dist/Image.lz4 ]; then
-          cp kernel/out/android12-5.10/dist/Image.lz4 kernel/AnyKernel3/Image.lz4
-        fi
+      # Filter ACPI dir from drivers/Makefile
+      - name: Filter ACPI dir from drivers/Makefile
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          if ! grep -q 'CI filter: prevent ACPI' drivers/Makefile; then
+            {
+              echo ''
+              echo '# CI filter: prevent ACPI from building on DT/arm64 Android'
+              echo 'subdir-y := $(filter-out acpi,$(subdir-y))'
+              echo 'subdir-m := $(filter-out acpi,$(subdir-m))'
+            } >> drivers/Makefile
+          fi
 
-    - name: Package Kernel ZIP
-      working-directory: kernel/AnyKernel3
-      run: |
-        zip -r ../${{ github.event.inputs.release_name }}.zip *
+      # Prepare defconfig
+      - name: Prepare kernel output directory (defconfig)
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          export PATH="/usr/lib/llvm-18/bin:$PATH"
+          export HOSTCC="clang-18"
+          export HOSTCXX="clang++-18"
+          mkdir -p out
+          make O=out ARCH=arm64 ${KERNEL_DEFCONFIG}
 
-    - name: Build Wi-Fi Module (qca_cld3)
-      working-directory: kernel
-      run: |
-        export PATH=/usr/lib/llvm-18/bin:$PATH
-        LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make modules_prepare
-        LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j$(nproc) -C drivers/staging/qcacld-3.0 M=$(pwd)/drivers/staging/qcacld-3.0 modules
-        mkdir -p ../modules/vendor/lib/modules
-        find out/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \;
-        sudo chown -R $(id -u):$(id -g) ../modules
+      # Non-interactive config finalize and enforcement
+      - name: Finalize kernel config (non-interactive + enforce)
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          export PATH="/usr/lib/llvm-18/bin:$PATH"
+          cat > ../ci.defaults <<'EOF'
+          CONFIG_QTI_GVM=n
+          CONFIG_NR_CPUS=8
+          CONFIG_HUGETLB_PAGE=n
+          CONFIG_HUGETLBFS=n
+          CONFIG_TRANSPARENT_HUGEPAGE=n
+          CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS=n
+          CONFIG_TRANSPARENT_HUGEPAGE_MADVISE=n
+          CONFIG_KSM=n
+          CONFIG_BTRFS_FS=n
+          CONFIG_BTRFS_FS_POSIX_ACL=n
+          CONFIG_TASKSTATS=n
+          CONFIG_TASK_DELAY_ACCT=n
+          CONFIG_TASK_XACCT=n
+          CONFIG_TASK_IO_ACCOUNTING=n
+          CONFIG_NFS_FS=n
+          CONFIG_NFS_V4=n
+          CONFIG_LOCKD=n
+          CONFIG_SUNRPC=n
+          CONFIG_IPV6=n
+          CONFIG_IPV6_SEG6_LWTUNNEL=n
+          CONFIG_IPV6_SEG6_BPF=n
+          CONFIG_BPF_SYSCALL=n
+          CONFIG_BPF_JIT=n
+          CONFIG_NETFILTER=n
+          CONFIG_NETFILTER_ADVANCED=n
+          CONFIG_NETFILTER_XTABLES=n
+          CONFIG_XDP_SOCKETS=n
+          CONFIG_NET_CLS_BPF=n
+          CONFIG_NET_ACT_BPF=n
+          CONFIG_MAC80211=n
+          CONFIG_BT=n
+          CONFIG_VLAN_8021Q=n
+          CONFIG_NET_9P=n
+          CONFIG_9P_FS=n
+          CONFIG_COMMON_CLK_BCM=n
+          CONFIG_CLK_BCM_IPROC=n
+          CONFIG_CLK_BCM2835=n
+          CONFIG_COMMON_CLK_HI3660=n
+          CONFIG_COMMON_CLK_HI3670=n
+          CONFIG_COMMON_CLK_HI6220=n
+          CONFIG_ACPI=n
+          CONFIG_ACPI_EC=n
+          CONFIG_ACPI_LPSS=n
+          CONFIG_ACPI_APEI=n
+          CONFIG_ACPI_APD=n
+          CONFIG_ACPI_PCI_SLOT=n
+          CONFIG_ACPI_PCI_ROOT=n
+          CONFIG_PCI_QUIRKS=n
+          CONFIG_PCIEAER=n
+          CONFIG_PCIEPORTBUS=n
+          CONFIG_COMPILE_TEST=n
+          CONFIG_LOCALVERSION=""
+          CONFIG_LOCALVERSION_AUTO=y
+          CONFIG_KERNEL_GZIP=y
+          CONFIG_KERNEL_BZIP2=n
+          CONFIG_KERNEL_LZMA=n
+          CONFIG_KERNEL_XZ=n
+          CONFIG_KERNEL_LZO=n
+          CONFIG_KERNEL_LZ4=n
+          CONFIG_CROSS_COMPILE="aarch64-linux-gnu-"
+          EOF
 
-    - name: Package Wi-Fi Module ZIP
-      run: |
-        if [ ! -d "modules/vendor/lib/modules" ] || ! ls modules/vendor/lib/modules/*.ko >/dev/null 2>&1; then
-          echo "No Wi-Fi modules to package, exiting."
-          exit 1
-        fi
-        cd modules
-        zip -r ../${{ github.event.inputs.release_name }}-modules.zip *
+          make O=out ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../ci.defaults
 
-    - name: Upload kernel build artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: kernel-output
-        path: kernel/out
+          if [ -x scripts/config ]; then
+            ./scripts/config --file out/.config \
+              --disable CONFIG_QTI_GVM --set-val CONFIG_NR_CPUS 8 \
+              --disable CONFIG_HUGETLB_PAGE --disable CONFIG_HUGETLBFS \
+              --disable CONFIG_TRANSPARENT_HUGEPAGE --disable CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS --disable CONFIG_TRANSPARENT_HUGEPAGE_MADVISE \
+              --disable CONFIG_KSM \
+              --disable CONFIG_BTRFS_FS --disable CONFIG_BTRFS_FS_POSIX_ACL \
+              --disable CONFIG_TASKSTATS --disable CONFIG_TASK_DELAY_ACCT --disable CONFIG_TASK_XACCT --disable CONFIG_TASK_IO_ACCOUNTING \
+              --disable CONFIG_NFS_FS --disable CONFIG_NFS_V4 --disable CONFIG_LOCKD --disable CONFIG_SUNRPC \
+              --disable CONFIG_IPV6 --disable CONFIG_IPV6_SEG6_LWTUNNEL --disable CONFIG_IPV6_SEG6_BPF \
+              --disable CONFIG_BPF_SYSCALL --disable CONFIG_BPF_JIT \
+              --disable CONFIG_NETFILTER --disable CONFIG_NETFILTER_ADVANCED --disable CONFIG_NETFILTER_XTABLES \
+              --disable CONFIG_XDP_SOCKETS --disable CONFIG_NET_CLS_BPF --disable CONFIG_NET_ACT_BPF \
+              --disable CONFIG_MAC80211 --disable CONFIG_BT --disable CONFIG_VLAN_8021Q \
+              --disable CONFIG_NET_9P --disable CONFIG_9P_FS \
+              --disable CONFIG_COMMON_CLK_BCM --disable CONFIG_CLK_BCM_IPROC --disable CONFIG_CLK_BCM2835 \
+              --disable CONFIG_COMMON_CLK_HI3660 --disable CONFIG_COMMON_CLK_HI3670 --disable CONFIG_COMMON_CLK_HI6220 \
+              --disable CONFIG_ACPI --disable CONFIG_ACPI_EC --disable CONFIG_ACPI_LPSS --disable CONFIG_ACPI_APEI --disable CONFIG_ACPI_APD --disable CONFIG_ACPI_PCI_SLOT --disable CONFIG_ACPI_PCI_ROOT \
+              --disable CONFIG_PCI_QUIRKS --disable CONFIG_PCIEAER --disable CONFIG_PCIEPORTBUS \
+              --disable CONFIG_COMPILE_TEST \
+              --set-str CONFIG_LOCALVERSION "" --enable CONFIG_LOCALVERSION_AUTO \
+              --enable CONFIG_KERNEL_GZIP \
+              --disable CONFIG_KERNEL_BZIP2 --disable CONFIG_KERNEL_LZMA --disable CONFIG_KERNEL_XZ --disable CONFIG_KERNEL_LZO --disable CONFIG_KERNEL_LZ4 || true
+          fi
 
-    - name: Upload zips
-      uses: actions/upload-artifact@v4
-      with:
-        name: build-zips
-        path: |
-          kernel/${{ github.event.inputs.release_name }}.zip
-          ${{ github.event.inputs.release_name }}-modules.zip
+          for s in CONFIG_BTRFS_FS CONFIG_BTRFS_FS_POSIX_ACL CONFIG_TASKSTATS CONFIG_TASK_DELAY_ACCT CONFIG_TASK_XACCT CONFIG_TASK_IO_ACCOUNTING \
+                   CONFIG_NFS_FS CONFIG_NFS_V4 CONFIG_LOCKD CONFIG_SUNRPC \
+                   CONFIG_HUGETLB_PAGE CONFIG_HUGETLBFS CONFIG_TRANSPARENT_HUGEPAGE CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS CONFIG_TRANSPARENT_HUGEPAGE_MADVISE CONFIG_KSM \
+                   CONFIG_IPV6 CONFIG_IPV6_SEG6_LWTUNNEL CONFIG_IPV6_SEG6_BPF \
+                   CONFIG_BPF_SYSCALL CONFIG_BPF_JIT CONFIG_NETFILTER CONFIG_NETFILTER_ADVANCED CONFIG_NETFILTER_XTABLES \
+                   CONFIG_XDP_SOCKETS CONFIG_NET_CLS_BPF CONFIG_NET_ACT_BPF \
+                   CONFIG_MAC80211 CONFIG_BT CONFIG_VLAN_8021Q CONFIG_NET_9P CONFIG_9P_FS \
+                   CONFIG_COMMON_CLK_BCM CONFIG_CLK_BCM_IPROC CONFIG_CLK_BCM2835 CONFIG_COMMON_CLK_HI3660 CONFIG_COMMON_CLK_HI3670 CONFIG_COMMON_CLK_HI6220 \
+                   CONFIG_ACPI CONFIG_ACPI_EC CONFIG_ACPI_LPSS CONFIG_ACPI_APEI CONFIG_ACPI_APD CONFIG_ACPI_PCI_SLOT CONFIG_ACPI_PCI_ROOT \
+                   CONFIG_PCI_QUIRKS CONFIG_PCIEAER CONFIG_PCIEPORTBUS CONFIG_COMPILE_TEST; do
+            sed -i "s/^${s}=.*/${s}=n/" out/.config
+          done
+          sed -i 's/^# CONFIG_NR_CPUS is not set$/CONFIG_NR_CPUS=8/' out/.config
+          sed -i 's/^CONFIG_NR_CPUS=.*/CONFIG_NR_CPUS=8/' out/.config
+          sed -i 's/^CONFIG_KERNEL_GZIP=.*/CONFIG_KERNEL_GZIP=y/' out/.config
+          for c in CONFIG_KERNEL_BZIP2 CONFIG_KERNEL_LZMA CONFIG_KERNEL_XZ CONFIG_KERNEL_LZO CONFIG_KERNEL_LZ4; do
+            sed -i "s/^${c}=.*/${c}=n/" out/.config
+          done
+          if ! grep -q '^CONFIG_CROSS_COMPILE=' out/.config; then
+            echo 'CONFIG_CROSS_COMPILE="aarch64-linux-gnu-"' >> out/.config
+          else
+            sed -i 's/^CONFIG_CROSS_COMPILE=.*/CONFIG_CROSS_COMPILE="aarch64-linux-gnu-"/' out/.config
+          fi
+
+          make O=out ARCH=arm64 olddefconfig
+
+          echo "==== Snapshot of critical toggles ===="
+          egrep -E '^(CONFIG_NR_CPUS|CONFIG_IPV6|CONFIG_IPV6_SEG6_BPF|CONFIG_BPF_SYSCALL|CONFIG_NETFILTER|CONFIG_MAC80211|CONFIG_COMMON_CLK_BCM|CONFIG_COMMON_CLK_HI|CONFIG_ACPI|CONFIG_NFS|CONFIG_BTRFS|CONFIG_TASKSTATS|CONFIG_HUGETLB_PAGE|CONFIG_TRANSPARENT_HUGEPAGE|CONFIG_KERNEL_GZIP)=' out/.config || true
+
+      - name: Prepare scripts and headers
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          export PATH="/usr/lib/llvm-18/bin:$PATH"
+          export HOSTCC="clang-18"
+          export HOSTCXX="clang++-18"
+          make ${KERNEL_CMDLINE} scripts CC="ccache clang-18"
+          make ${KERNEL_CMDLINE} prepare CC="ccache clang-18"
+
+      - name: Verify critical toggles and blackholes
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          if ! grep -q '^CONFIG_NR_CPUS=8' out/.config; then
+            echo "Error: NR_CPUS not 8"
+            exit 1
+          fi
+          for s in CONFIG_IPV6 CONFIG_IPV6_SEG6_LWTUNNEL CONFIG_IPV6_SEG6_BPF CONFIG_BPF_SYSCALL CONFIG_BPF_JIT \
+                   CONFIG_NETFILTER CONFIG_NETFILTER_ADVANCED CONFIG_NETFILTER_XTABLES CONFIG_XDP_SOCKETS CONFIG_NET_CLS_BPF CONFIG_NET_ACT_BPF \
+                   CONFIG_MAC80211 CONFIG_BT CONFIG_VLAN_8021Q CONFIG_NET_9P CONFIG_9P_FS \
+                   CONFIG_COMMON_CLK_BCM CONFIG_CLK_BCM_IPROC CONFIG_CLK_BCM2835 CONFIG_COMMON_CLK_HI3660 CONFIG_COMMON_CLK_HI3670 CONFIG_COMMON_CLK_HI6220 \
+                   CONFIG_ACPI CONFIG_NFS_FS CONFIG_BTRFS_FS CONFIG_TASKSTATS CONFIG_HUGETLB_PAGE CONFIG_TRANSPARENT_HUGEPAGE; do
+            if grep -q "^${s}=[my]" out/.config; then
+              echo "Error: ${s} still enabled"
+              exit 1
+            fi
+          done
+
+          for d in drivers/clk/hisilicon drivers/clk/bcm drivers/clk/berlin net/ipv6 net/bridge net/8021q net/bluetooth net/9p net/netfilter net/mac80211 net/llc; do
+            if [ -d "$d" ]; then
+              if [ -f "$d/Makefile" ] && [ -s "$d/Makefile" ]; then
+                echo "Error: $d Makefile not blackholed"
+                exit 1
+              fi
+            fi
+          done
+
+      - name: Build kernel
+        working-directory: kernel
+        env:
+          KBUILD_OUTPUT: out
+        run: |
+          set -euo pipefail
+          export PATH="/usr/lib/llvm-18/bin:$PATH"
+          export LD_LIBRARY_PATH="/usr/lib/llvm-18/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export DTC_EXT="dtc"
+          export HOSTCC="clang-18"
+          export HOSTCXX="clang++-18"
+
+          make O=out ARCH=arm64 olddefconfig
+          make ${KERNEL_CMDLINE} CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j$(nproc)
+          test -f out/arch/arm64/boot/Image
+          cp out/arch/arm64/boot/Image ../AnyKernel3
+
+      - name: Build Wi-Fi Module (qca_cld3)
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          export PATH="/usr/lib/llvm-18/bin:$PATH"
+          export LD_LIBRARY_PATH="/usr/lib/llvm-18/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export HOSTCC="clang-18"
+          export HOSTCXX="clang++-18"
+
+          make ${KERNEL_CMDLINE} modules_prepare CC="ccache clang-18"
+          make ${KERNEL_CMDLINE} CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" \
+            OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" \
+            -j$(nproc) M=drivers/staging/qcacld-3.0 modules
+
+          sudo mkdir -p ../modules/vendor/lib/modules
+          sudo find out/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \;
+          sudo chown -R "$(id -u)":"$(id -g)" ../modules
+
+      - name: Package Kernel
+        run: |
+          set -euo pipefail
+          cd AnyKernel3
+          zip -r ../${{ env.OUTPUT_ZIP_NAME }}.zip *
+          cd ..
+
+      - name: Package Wi-Fi Module
+        run: |
+          set -euo pipefail
+          if [ ! -d "modules/vendor/lib/modules" ] || ! ls modules/vendor/lib/modules/*.ko >/dev/null 2>&1; then
+            echo "Error: No Wi-Fi modules found to package!"
+            exit 1
+          fi
+          cd modules
+          zip -r ../${{ env.OUTPUT_ZIP_NAME }}-modules.zip *
+          cd ..
+
+      - name: Upload kernel build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-out
+          path: kernel/out
+          if-no-files-found: warn
+
+      - name: Upload zips
+        uses: actions/upload-artifact@v4
+        with:
+          name: outputs
+          path: |
+            ${{ env.OUTPUT_ZIP_NAME }}.zip
+            ${{ env.OUTPUT_ZIP_NAME }}-modules.zip
+          if-no-files-found: error
