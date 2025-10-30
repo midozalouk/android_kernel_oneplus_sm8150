@@ -1,4 +1,4 @@
-name: Custom build kernel and Wi-Fi module
+name: Custom Build kernel and Wi-Fi module
 
 on:
   workflow_dispatch:
@@ -87,8 +87,8 @@ jobs:
           patch -N -p1 < 50_add_susfs_in_kernel-4.14.patch
         fi
         if find . -name "*.rej" | grep -q .; then
-          echo "SUSFS patch rejects found:"; find . -name "*.rej" -print -exec sed -n '1,20p' {} \;;
-          exit 1;
+          echo "SUSFS patch rejects found:"; find . -name "*.rej" -print -exec sed -n '1,20p' {} \;
+          exit 1
         fi
 
     - name: Patch btrfs struct timespec64 using patch file
