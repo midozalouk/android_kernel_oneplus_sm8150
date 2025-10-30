@@ -18,11 +18,13 @@ on:
       use_kernelsu_next:
         description: 'Use KernelSU-Next instead of KernelSU'
         required: true
-        default: 'false'
+        default: 'true'
+        type: boolean
       enable_susfs:
         description: 'Enable SUSFS patches'
         required: true
-        default: 'false'
+        default: 'true'
+        type: boolean
       release_name:
         description: 'Release name for ZIPs'
         required: true
@@ -31,202 +33,213 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-    - name: Checkout repository fresh
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
+      - name: Checkout repository fresh
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Install full build dependencies (including cross-toolchain)
-      run: |
-        sudo apt-get update -y
-        sudo apt-get install -y git device-tree-compiler lz4 xz-utils zlib1g-dev openjdk-17-jdk gcc g++ python3 python-is-python3 p7zip-full android-sdk-libsparse-utils erofs-utils default-jdk git gnupg flex bison gperf build-essential zip curl libc6-dev libncurses-dev libx11-dev libreadline-dev libgl1 libgl1-mesa-dev python3 make sudo gcc g++ bc grep tofrodos python3-markdown libxml2-utils xsltproc libtinfo6 make repo cpio kmod openssl libelf-dev pahole libssl-dev libarchive-tools zstd rsync --fix-missing
-        sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+      - name: Install full build dependencies (including cross-toolchain)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --fix-missing \
+            git device-tree-compiler lz4 xz-utils zlib1g-dev openjdk-17-jdk \
+            gcc g++ python3 python-is-python3 p7zip-full android-sdk-libsparse-utils \
+            erofs-utils default-jdk gnupg flex bison gperf build-essential zip curl \
+            libc6-dev libncurses-dev libx11-dev libreadline-dev libgl1 libgl1-mesa-dev \
+            make sudo bc grep tofrodos python3-markdown libxml2-utils xsltproc libtinfo6 \
+            repo cpio kmod openssl libelf-dev pahole libssl-dev libarchive-tools zstd rsync \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
 
-    - name: Verify cross-compiler binaries
-      run: |
-        aarch64-linux-gnu-gcc --version
-        which aarch64-linux-gnu-ld
-        aarch64-linux-gnu-ld --version
+      - name: Verify cross-compiler binaries
+        run: |
+          aarch64-linux-gnu-gcc --version
+          which aarch64-linux-gnu-ld
+          aarch64-linux-gnu-ld --version
 
-    - name: Clean workspace & clone kernel
-      run: |
-        rm -rf kernel modules || true
-        git clone --depth=1 --branch "${{ github.event.inputs.kernel_branch }}" "${{ github.event.inputs.kernel_repo_url }}" kernel
-        cd kernel
-        git submodule update --init --recursive
-        chmod +755 -R .
+      - name: Clean workspace & clone kernel
+        run: |
+          rm -rf kernel modules || true
+          git clone --depth=1 --branch "${{ github.event.inputs.kernel_branch }}" "${{ github.event.inputs.kernel_repo_url }}" kernel
+          cd kernel
+          git submodule update --init --recursive
+          chmod +755 -R .
 
-    - name: Setup KernelSU or KernelSU-Next
-      working-directory: kernel
-      run: |
-        export PATH=/usr/lib/llvm-18/bin:$PATH
-        if [ "${{ github.event.inputs.use_kernelsu_next }}" = "true" ]; then
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
-        else
-          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s stable
-        fi
-
-    - name: Apply SUSFS patches if enabled
-      if: github.event.inputs.enable_susfs == 'true'
-      working-directory: kernel
-      run: |
-        git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.14 susfs_patches
-        cp susfs_patches/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/ || true
-        cp susfs_patches/kernel_patches/50_add_susfs_in_kernel-4.14.patch . || true
-        cp -r susfs_patches/kernel_patches/fs/* ./fs/ || true
-        cp -r susfs_patches/kernel_patches/include/linux/* ./include/linux/ || true
-        if [ -f KernelSU/10_enable_susfs_for_ksu.patch ]; then
-          (cd KernelSU && patch -N -p1 < 10_enable_susfs_for_ksu.patch)
-        fi
-        if [ -f 50_add_susfs_in_kernel-4.14.patch ]; then
-          patch -N -p1 < 50_add_susfs_in_kernel-4.14.patch
-        fi
-        if find . -name "*.rej" | grep -q .; then
-          echo "SUSFS patch rejects found:"
-          find . -name "*.rej" -print -exec sed -n '1,20p' {} \;
-          exit 1
-        fi
-
-    - name: Patch btrfs struct timespec64 using patch file
-      working-directory: kernel
-      run: |
-        patchfile="btrfs_timespec64.patch"
-        cat > "$patchfile" <<'EOF'
---- a/fs/btrfs/inode.c
-+++ b/fs/btrfs/inode.c
-@@ -6627,7 +6627,7 @@
--                struct timespec now = current_time(&parent_inode->vfs_inode);
-+                struct timespec64 now = current_time(&parent_inode->vfs_inode);
-EOF
-        if grep -qF "struct timespec now = current_time(&parent_inode->vfs_inode);" fs/btrfs/inode.c; then
-          patch -p1 < "$patchfile" || (echo "Patch failed or already applied"; exit 1)
-        else
-          echo "Patch already applied or no match"
-        fi
-        sed -n '6620,6640p' fs/btrfs/inode.c | tail -20
-
-    - name: Patch try_to_unmap argument pattern
-      working-directory: kernel
-      run: |
-        sed -i 's@try_to_unmap(page, ttu_flags);@try_to_unmap(page, ttu_flags, NULL);@g' mm/huge_memory.c
-        grep -C2 "try_to_unmap" mm/huge_memory.c | cat -n
-
-    - name: Patch hugetlbpage ptep allocation (safe/atomic, non-fatal)
-      working-directory: kernel
-      run: |
-        file=arch/arm64/mm/hugetlbpage.c
-        ln=$(awk '/huge_pte_alloc/{f=1} f && /{/{print NR; exit}' "$file")
-        if [ -n "$ln" ]; then
-          if ! sed -n "$((ln+1)),$((ln+15))p" "$file" | grep -q "pte_t \*ptep"; then
-            sed -i "$((ln+1)) i\    pte_t *ptep = NULL;" "$file"
-            echo "Inserted 'pte_t *ptep = NULL;' after line $ln"
+      - name: Setup KernelSU or KernelSU-Next
+        working-directory: ./kernel
+        run: |
+          export PATH=/usr/lib/llvm-18/bin:$PATH
+          if [ "${{ github.event.inputs.use_kernelsu_next }}" = "true" ]; then
+            curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
+          else
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s stable
           fi
-          sed -i 's@ptep = huge_pmd_share(mm, vma, addr, pud);@if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);@' "$file"
-        else
-          echo "huge_pte_alloc function not found, skipping ptep patch"
-        fi
-        grep -n "pte_t \*ptep" "$file" | cat -n || true
-        grep -C4 "ptep = huge_pmd_share" "$file" | cat -n || true
 
-    - name: Remove mm->nr_ptes usage (safe/atomic)
-      working-directory: kernel
-      run: |
-        sed -i 's@\(.*mm->nr_ptes.*\)@/* REMOVED_for_ARM64 \1 */@' mm/khugepaged.c
-        grep -C2 "nr_ptes" mm/khugepaged.c | cat -n || true
+      - name: Apply SUSFS patches if enabled
+        if: github.event.inputs.enable_susfs == 'true'
+        working-directory: ./kernel
+        run: |
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.14 susfs_patches
+          cp susfs_patches/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/ || true
+          cp susfs_patches/kernel_patches/50_add_susfs_in_kernel-4.14.patch . || true
+          cp -r susfs_patches/kernel_patches/fs/* ./fs/ || true
+          cp -r susfs_patches/kernel_patches/include/linux/* ./include/linux/ || true
+          if [ -f KernelSU/10_enable_susfs_for_ksu.patch ]; then
+            (cd KernelSU && patch -N -p1 < 10_enable_susfs_for_ksu.patch)
+          fi
+          if [ -f 50_add_susfs_in_kernel-4.14.patch ]; then
+            patch -N -p1 < 50_add_susfs_in_kernel-4.14.patch
+          fi
+          if find . -name "*.rej" | grep -q .; then
+            echo "SUSFS patch rejects found:"
+            find . -name "*.rej" -print -exec sed -n '1,20p' {} \;
+            exit 1
+          fi
 
-    - name: Add SUSFS configs if enabled
-      if: github.event.inputs.enable_susfs == 'true'
-      working-directory: kernel
-      run: |
-        conf="arch/arm64/configs/${{ github.event.inputs.defconfig_file }}"
-        cat >> "$conf" <<'EOF'
-CONFIG_KSU=y
-CONFIG_KSU_SUSFS=y
-CONFIG_KSU_SUSFS_SUS_PATH=y
-CONFIG_KSU_SUSFS_SUS_MOUNT=y
-CONFIG_KSU_SUSFS_SUS_KSTAT=y
-CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
-CONFIG_KSU_SUSFS_TRY_UMOUNT=y
-CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-CONFIG_KSU_SUSFS_ENABLE_LOG=y
-CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-CONFIG_KSU_SUSFS_SUS_SU=y
-EOF
+      - name: Patch btrfs struct timespec64 using patch file
+        working-directory: ./kernel
+        run: |
+          patchfile="btrfs_timespec64.patch"
+          cat > $patchfile <<EOF
+          --- a/fs/btrfs/inode.c
+          +++ b/fs/btrfs/inode.c
+          @@ -6627,7 +6627,7 @@
+          -                struct timespec now = current_time(&parent_inode->vfs_inode);
+          +                struct timespec64 now = current_time(&parent_inode->vfs_inode);
+          EOF
+          if grep -qF "struct timespec now = current_time(&parent_inode->vfs_inode);" fs/btrfs/inode.c; then
+            patch -p1 < $patchfile || (echo "Patch failed or already applied"; exit 1)
+          else
+            echo "Patch already applied or no match"
+          fi
 
-    - name: Disable problematic configs
-      working-directory: kernel
-      run: |
-        conf="arch/arm64/configs/${{ github.event.inputs.defconfig_file }}"
-        for opt in CONFIG_TASKSTATS CONFIG_TASK_DELAY_ACCT CONFIG_TASK_XACCT CONFIG_TASK_IO_ACCOUNTING; do
-          sed -i "/^$opt[= ]/d" "$conf" || true
-          echo "${opt}=n" >> "$conf"
-        done
-        tail -n 10 "$conf"
+      - name: Patch try_to_unmap argument pattern
+        working-directory: ./kernel
+        run: |
+          sed -i 's|try_to_unmap(page, ttu_flags);|try_to_unmap(page, ttu_flags, NULL);|g' mm/huge_memory.c
+          echo "Applied try_to_unmap patch."
 
-    - name: Ensure NR_CPUS config
-      working-directory: kernel
-      run: |
-        conf="arch/arm64/configs/${{ github.event.inputs.defconfig_file }}"
-        grep -q '^CONFIG_NR_CPUS=' "$conf" || echo 'CONFIG_NR_CPUS=8' >> "$conf"
+      - name: Patch hugetlbpage ptep allocation (safe/atomic, non-fatal)
+        working-directory: ./kernel
+        run: |
+          file=arch/arm64/mm/hugetlbpage.c
+          if [ ! -f "$file" ]; then
+            echo "File not found: $file, skipping patch."
+            exit 0
+          fi
+          ln=$(awk '/huge_pte_alloc/{f=1} f && /{/{print NR; exit}' $file)
+          if [ -n "$ln" ]; then
+            if ! sed -n "$((ln+1)),$((ln+15))p" $file | grep -q "pte_t *ptep"; then
+              sed -i "$((ln+1)) i\    pte_t *ptep = NULL;" $file
+              echo "Inserted 'pte_t *ptep = NULL;' after line $ln"
+            fi
+            sed -i 's/ptep = huge_pmd_share(mm, vma, addr, pud);/if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);/' $file
+          else
+            echo "huge_pte_alloc function not found, skipping ptep patch"
+          fi
 
-    - name: Prepare kernel config
-      working-directory: kernel
-      run: |
-        export PATH=/usr/lib/llvm-18/bin:$PATH
-        make mrproper
-        LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make ${{ github.event.inputs.defconfig_file }}
-        LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make olddefconfig
-        grep 'CONFIG_NR_CPUS=' .config
+      - name: Remove mm->nr_ptes usage (safe/atomic)
+        working-directory: ./kernel
+        run: |
+          sed -i 's/\(.*mm->nr_ptes.*\)/\/\* REMOVED_for_ARM64 \1 \*\//' mm/khugepaged.c
+          echo "Commented out mm->nr_ptes usage."
 
-    - name: Build kernel
-      working-directory: kernel
-      run: |
-        export PATH=/usr/lib/llvm-18/bin:$PATH
-        LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j$(nproc)
+      - name: Add SUSFS configs if enabled
+        if: github.event.inputs.enable_susfs == 'true'
+        working-directory: ./kernel
+        run: |
+          conf="arch/arm64/configs/${{ github.event.inputs.defconfig_file }}"
+          {
+            echo "CONFIG_KSU=y"
+            echo "CONFIG_KSU_SUSFS=y"
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y"
+            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_SU=y"
+          } >> "$conf"
 
-    - name: Copy kernel Image.lz4 if exists
-      if: always()
-      run: |
-        if [ -f kernel/out/android12-5.10/dist/Image.lz4 ]; then
-          cp kernel/out/android12-5.10/dist/Image.lz4 kernel/AnyKernel3/Image.lz4
-        fi
+      - name: Disable problematic configs
+        working-directory: ./kernel
+        run: |
+          conf="arch/arm64/configs/${{ github.event.inputs.defconfig_file }}"
+          for opt in CONFIG_TASKSTATS CONFIG_TASK_DELAY_ACCT CONFIG_TASK_XACCT CONFIG_TASK_IO_ACCOUNTING; do
+            sed -i "/^$opt[= ]/d" "$conf" || true
+            echo "${opt}=n" >> "$conf"
+          done
 
-    - name: Package Kernel ZIP
-      working-directory: kernel/AnyKernel3
-      run: |
-        zip -r ../${{ github.event.inputs.release_name }}.zip *
+      - name: Ensure NR_CPUS config
+        working-directory: ./kernel
+        run: |
+          conf="arch/arm64/configs/${{ github.event.inputs.defconfig_file }}"
+          grep -q '^CONFIG_NR_CPUS=' "$conf" || echo 'CONFIG_NR_CPUS=8' >> "$conf"
 
-    - name: Build Wi-Fi Module (qca_cld3)
-      working-directory: kernel
-      run: |
-        export PATH=/usr/lib/llvm-18/bin:$PATH
-        LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make modules_prepare
-        LTO=thin ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j$(nproc) -C drivers/staging/qcacld-3.0 M=$(pwd)/drivers/staging/qcacld-3.0 modules
-        mkdir -p ../modules/vendor/lib/modules
-        find out/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \;
-        sudo chown -R $(id -u):$(id -g) ../modules
+      - name: Prepare kernel config
+        working-directory: ./kernel
+        run: |
+          export PATH=/usr/lib/llvm-18/bin:$PATH
+          make mrproper
+          make O=out ARCH=arm64 LTO=thin CROSS_COMPILE=aarch64-linux-gnu- ${{ github.event.inputs.defconfig_file }}
+          make O=out ARCH=arm64 LTO=thin CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 
-    - name: Package Wi-Fi Module ZIP
-      run: |
-        if [ ! -d "modules/vendor/lib/modules" ] || ! ls modules/vendor/lib/modules/*.ko >/dev/null 2>&1; then
-          echo "No Wi-Fi modules to package, exiting."
-          exit 1
-        fi
-        cd modules
-        zip -r ../${{ github.event.inputs.release_name }}-modules.zip *
+      - name: Build kernel
+        working-directory: ./kernel
+        run: |
+          export PATH=/usr/lib/llvm-18/bin:$PATH
+          make O=out ARCH=arm64 LTO=thin CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
 
-    - name: Upload kernel build artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: kernel-output
-        path: kernel/out
+      - name: Copy kernel Image if it exists
+        if: always()
+        run: |
+          if [ -f kernel/out/arch/arm64/boot/Image.lz4 ]; then
+            mkdir -p kernel/AnyKernel3
+            cp kernel/out/arch/arm64/boot/Image.lz4 kernel/AnyKernel3/Image.lz4
+          elif [ -f kernel/out/arch/arm64/boot/Image ]; then
+            mkdir -p kernel/AnyKernel3
+            cp kernel/out/arch/arm64/boot/Image kernel/AnyKernel3/Image
+          else
+            echo "Kernel Image not found in standard output locations."
+          fi
 
-    - name: Upload zips
-      uses: actions/upload-artifact@v4
-      with:
-        name: build-zips
-        path: |
-          kernel/${{ github.event.inputs.release_name }}.zip
-          ${{ github.event.inputs.release_name }}-modules.zip
+      - name: Package Kernel ZIP
+        run: |
+          if [ -d "kernel/AnyKernel3" ] && [ -n "$(ls -A kernel/AnyKernel3)" ]; then
+            cd kernel/AnyKernel3
+            zip -r ../../${{ github.event.inputs.release_name }}.zip * -x ".*" -x "__MACOSX"
+            cd ../../
+          else
+            echo "AnyKernel3 directory is empty or missing, skipping kernel zip."
+          fi
+
+      - name: Build Wi-Fi Module (qca_cld3)
+        working-directory: ./kernel
+        run: |
+          export PATH=/usr/lib/llvm-18/bin:$PATH
+          make O=out ARCH=arm64 LTO=thin CROSS_COMPILE=aarch64-linux-gnu- modules_prepare
+          make O=out ARCH=arm64 LTO=thin CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) M=$(pwd)/drivers/staging/qcacld-3.0 modules
+          mkdir -p ../modules/vendor/lib/modules
+          find out/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \;
+          sudo chown -R $(id -u):$(id -g) ../modules
+
+      - name: Package Wi-Fi Module ZIP
+        run: |
+          if [ ! -d "modules/vendor/lib/modules" ] || ! ls modules/vendor/lib/modules/*.ko >/dev/null 2>&1; then
+            echo "No Wi-Fi modules found to package."
+          else
+            cd modules
+            zip -r ../${{ github.event.inputs.release_name }}-modules.zip *
+            cd ..
+          fi
+
+      - name: Upload zips
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-zips
+          path: |
+            ${{ github.event.inputs.release_name }}.zip
+            ${{ github.event.inputs.release_name }}-modules.zip
+          if-no-files-found: warn
