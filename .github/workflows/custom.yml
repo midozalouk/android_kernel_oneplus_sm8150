@@ -1,4 +1,4 @@
-name: Custom Build kernel and Wi-Fi module
+name: Custom build kernel and Wi-Fi module
 
 on:
   workflow_dispatch:
@@ -91,14 +91,23 @@ jobs:
           exit 1;
         fi
 
-    - name: Patch btrfs struct timespec64 (idempotent sed)
+    - name: Patch btrfs struct timespec64 using patch file
       working-directory: kernel
       run: |
-        file=fs/btrfs/inode.c
-        orig='struct timespec now = current_time(&parent_inode->vfs_inode);'
-        repl='struct timespec64 now = current_time(&parent_inode->vfs_inode);'
-        grep -qF "$orig" "$file" && sed -i "s|$orig|$repl|" "$file"
-        grep -E "struct timespec64|struct timespec now" "$file" | cat -n
+        patchfile="btrfs_timespec64.patch"
+        cat > $patchfile <<EOF
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -6627,7 +6627,7 @@
+-                struct timespec now = current_time(&parent_inode->vfs_inode);
++                struct timespec64 now = current_time(&parent_inode->vfs_inode);
+EOF
+        if grep -qF "struct timespec now = current_time(&parent_inode->vfs_inode);" fs/btrfs/inode.c; then
+          patch -p1 < $patchfile || (echo "Patch failed or already applied"; exit 1)
+        else
+          echo "Patch already applied or no match"
+        fi
+        sed -n '6620,6640p' fs/btrfs/inode.c | tail -20
 
     - name: Patch try_to_unmap argument pattern
       working-directory: kernel
