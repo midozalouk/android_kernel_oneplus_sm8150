@@ -18,7 +18,7 @@ on:
       use_kernelsu_next:
         description: 'Use KernelSU-Next instead of KernelSU'
         required: true
-        default: true
+        default: false
         type: boolean
       enable_susfs:
         description: 'Enable SUSFS patches'
