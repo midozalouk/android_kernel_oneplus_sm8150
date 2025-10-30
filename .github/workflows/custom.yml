@@ -54,7 +54,7 @@ jobs:
           sed -i 's|try_to_unmap(page, ttu_flags);|try_to_unmap(page, ttu_flags, NULL);|g' mm/huge_memory.c
           sed -i 's/\(.*mm->nr_ptes.*\)/\/\* REMOVED_for_ARM64 \1 \*\//' mm/khugepaged.c
           if grep -qF "struct timespec now = current_time(&parent_inode->vfs_inode);" fs/btrfs/inode.c; then
-            cat > btrfs_patch.diff <<'EOF'
+            cat > btrfs_patch.diff <<- 'EOF'
           --- a/fs/btrfs/inode.c
           +++ b/fs/btrfs/inode.c
           @@ -6627,7 +6627,7 @@
