@@ -10,20 +10,20 @@ on:
       kernel_branch:
         description: 'Kernel branch'
         required: true
-        default: 'lineage-22.1'
+        default: 'lineage-23.0'
       defconfig_file:
         description: 'Kernel defconfig filename'
         required: true
-        default: 'lineage_sm8150_defconfig'
+        default: 'defconfig'
       use_kernelsu_next:
         description: 'Use KernelSU-Next instead of KernelSU'
         required: true
-        default: 'true'
+        default: true
         type: boolean
       enable_susfs:
         description: 'Enable SUSFS patches'
         required: true
-        default: 'true'
+        default: false
         type: boolean
       release_name:
         description: 'Release name for ZIPs'
@@ -39,7 +39,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install full build dependencies (including cross-toolchain)
+      - name: Install full build dependencies
         run: |
           sudo apt-get update -y
           sudo apt-get install -y --fix-missing \
@@ -76,7 +76,7 @@ jobs:
           fi
 
       - name: Apply SUSFS patches if enabled
-        if: github.event.inputs.enable_susfs == 'true'
+        if: github.event.inputs.enable_susfs == true
         working-directory: ./kernel
         run: |
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.14 susfs_patches
@@ -96,21 +96,21 @@ jobs:
             exit 1
           fi
 
-      - name: Patch btrfs struct timespec64 using patch file
+      - name: Patch btrfs struct timespec64
         working-directory: ./kernel
         run: |
           patchfile="btrfs_timespec64.patch"
-          cat > $patchfile <<EOF
-          --- a/fs/btrfs/inode.c
-          +++ b/fs/btrfs/inode.c
-          @@ -6627,7 +6627,7 @@
-          -                struct timespec now = current_time(&parent_inode->vfs_inode);
-          +                struct timespec64 now = current_time(&parent_inode->vfs_inode);
-          EOF
+          cat > $patchfile <<'EOF'
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -6627,7 +6627,7 @@
+-                struct timespec now = current_time(&parent_inode->vfs_inode);
++                struct timespec64 now = current_time(&parent_inode->vfs_inode);
++EOF
           if grep -qF "struct timespec now = current_time(&parent_inode->vfs_inode);" fs/btrfs/inode.c; then
-            patch -p1 < $patchfile || (echo "Patch failed or already applied"; exit 1)
+            patch -p1 < $patchfile
           else
-            echo "Patch already applied or no match"
+            echo "Patch for btrfs timespec64 already applied or no match found."
           fi
 
       - name: Patch try_to_unmap argument pattern
@@ -119,7 +119,7 @@ jobs:
           sed -i 's|try_to_unmap(page, ttu_flags);|try_to_unmap(page, ttu_flags, NULL);|g' mm/huge_memory.c
           echo "Applied try_to_unmap patch."
 
-      - name: Patch hugetlbpage ptep allocation (safe/atomic, non-fatal)
+      - name: Patch hugetlbpage ptep allocation
         working-directory: ./kernel
         run: |
           file=arch/arm64/mm/hugetlbpage.c
@@ -129,7 +129,7 @@ jobs:
           fi
           ln=$(awk '/huge_pte_alloc/{f=1} f && /{/{print NR; exit}' $file)
           if [ -n "$ln" ]; then
-            if ! sed -n "$((ln+1)),$((ln+15))p" $file | grep -q "pte_t *ptep"; then
+            if ! sed -n "$((ln+1)),$((ln+15))p" $file | grep -q "pte_t \*ptep"; then
               sed -i "$((ln+1)) i\    pte_t *ptep = NULL;" $file
               echo "Inserted 'pte_t *ptep = NULL;' after line $ln"
             fi
@@ -138,29 +138,20 @@ jobs:
             echo "huge_pte_alloc function not found, skipping ptep patch"
           fi
 
-      - name: Remove mm->nr_ptes usage (safe/atomic)
+      - name: Remove mm->nr_ptes usage
         working-directory: ./kernel
         run: |
           sed -i 's/\(.*mm->nr_ptes.*\)/\/\* REMOVED_for_ARM64 \1 \*\//' mm/khugepaged.c
           echo "Commented out mm->nr_ptes usage."
 
       - name: Add SUSFS configs if enabled
-        if: github.event.inputs.enable_susfs == 'true'
+        if: github.event.inputs.enable_susfs == true
         working-directory: ./kernel
         run: |
           conf="arch/arm64/configs/${{ github.event.inputs.defconfig_file }}"
           {
             echo "CONFIG_KSU=y"
             echo "CONFIG_KSU_SUSFS=y"
-            echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
-            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
-            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
-            echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y"
-            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
-            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
-            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
-            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
-            echo "CONFIG_KSU_SUSFS_SUS_SU=y"
           } >> "$conf"
 
       - name: Disable problematic configs
@@ -209,7 +200,7 @@ jobs:
         run: |
           if [ -d "kernel/AnyKernel3" ] && [ -n "$(ls -A kernel/AnyKernel3)" ]; then
             cd kernel/AnyKernel3
-            zip -r ../../${{ github.event.inputs.release_name }}.zip * -x ".*" -x "__MACOSX"
+            zip -r ../../${{ github.event.inputs.release_name }}.zip ./*
             cd ../../
           else
             echo "AnyKernel3 directory is empty or missing, skipping kernel zip."
@@ -222,7 +213,7 @@ jobs:
           make O=out ARCH=arm64 LTO=thin CROSS_COMPILE=aarch64-linux-gnu- modules_prepare
           make O=out ARCH=arm64 LTO=thin CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) M=$(pwd)/drivers/staging/qcacld-3.0 modules
           mkdir -p ../modules/vendor/lib/modules
-          find out/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \;
+          find out -name "wlan.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \;
           sudo chown -R $(id -u):$(id -g) ../modules
 
       - name: Package Wi-Fi Module ZIP
@@ -231,7 +222,7 @@ jobs:
             echo "No Wi-Fi modules found to package."
           else
             cd modules
-            zip -r ../${{ github.event.inputs.release_name }}-modules.zip *
+            zip -r ../${{ github.event.inputs.release_name }}-modules.zip ./*
             cd ..
           fi
 
