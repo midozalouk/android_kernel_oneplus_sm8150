@@ -13,7 +13,7 @@ on:
       defconfig_file:
         description: 'Kernel defconfig filename'
         required: true
-        default: 'lineage_sm8150_defconfig'
+        default: 'defconfig'
       use_kernelsu_next:
         description: 'Use KernelSU-Next'
         required: true
@@ -35,7 +35,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
       - name: Install dependencies
-        run: sudo apt-get update -y && sudo apt-get install -y --fix-missing git device-tree-compiler lz4 xz-utils zlib1g-dev openjdk-17-jdk gcc g++ python3 python-is-python3 p7zip-full android-sdk-libsparse-utils erofs-utils default-jdk gnupg flex bison gperf build-essential zip curl libc6-dev libncurses-dev libx11-dev libreadline-dev libgl1-mesa-dev make sudo bc grep tofrodos python3-markdown libxml2-utils xsltproc libtinfo6 repo cpio kmod openssl libelf-dev pahole libssl-dev libarchive-tools zstd rsync gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --fix-missing git device-tree-compiler lz4 xz-utils zlib1g-dev openjdk-17-jdk gcc g++ python3 python-is-python3 p7zip-full android-sdk-libsparse-utils erofs-utils default-jdk gnupg flex bison gperf build-essential zip curl libc6-dev libncurses-dev libx11-dev libreadline-dev libgl1-mesa-dev make sudo bc grep tofrodos python3-markdown libxml2-utils xsltproc libtinfo6 repo cpio kmod openssl libelf-dev pahole libssl-dev libarchive-tools zstd rsync gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
       - name: Clone kernel
         run: git clone --depth=1 --branch "${{ github.event.inputs.kernel_branch }}" "${{ github.event.inputs.kernel_repo_url }}" kernel
       - name: Setup KernelSU
@@ -51,30 +53,49 @@ jobs:
         run: |
           sed -i 's|try_to_unmap(page, ttu_flags);|try_to_unmap(page, ttu_flags, NULL);|g' mm/huge_memory.c
           sed -i 's/\(.*mm->nr_ptes.*\)/\/\* REMOVED_for_ARM64 \1 \*\//' mm/khugepaged.c
-          if grep -qF "struct timespec now = current_time(&parent_inode->vfs_inode);" fs/btrfs/inode.c; then patch -p1 -i <(echo "--- a/fs/btrfs/inode.c\n+++ b/fs/btrfs/inode.c\n@@ -6627,7 +6627,7 @@\n-                struct timespec now = current_time(&parent_inode->vfs_inode);\n+                struct timespec64 now = current_time(&parent_inode->vfs_inode);"); fi
+          if grep -qF "struct timespec now = current_time(&parent_inode->vfs_inode);" fs/btrfs/inode.c; then
+            cat > btrfs_patch.diff <<'EOF'
+          --- a/fs/btrfs/inode.c
+          +++ b/fs/btrfs/inode.c
+          @@ -6627,7 +6627,7 @@
+          -                struct timespec now = current_time(&parent_inode->vfs_inode);
+          +                struct timespec64 now = current_time(&parent_inode->vfs_inode);
+          EOF
+            patch -p1 < btrfs_patch.diff
+          fi
       - name: Prepare kernel config
         working-directory: ./kernel
         run: |
           conf="arch/arm64/configs/${{ github.event.inputs.defconfig_file }}"
           echo "CONFIG_NR_CPUS=8" >> "$conf"
           for opt in CONFIG_TASKSTATS CONFIG_TASK_DELAY_ACCT CONFIG_TASK_XACCT CONFIG_TASK_IO_ACCOUNTING; do echo "${opt}=n" >> "$conf"; done
-          make mrproper && make O=out ARCH=arm64 LTO=thin CROSS_COMPILE=aarch64-linux-gnu- ${{ github.event.inputs.defconfig_file }} && make O=out ARCH=arm64 LTO=thin CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          make mrproper
+          make O=out ARCH=arm64 LTO=thin CROSS_COMPILE=aarch64-linux-gnu- ${{ github.event.inputs.defconfig_file }}
+          make O=out ARCH=arm64 LTO=thin CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
       - name: Build kernel
         working-directory: ./kernel
         run: make O=out ARCH=arm64 LTO=thin CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
       - name: Package Kernel ZIP
         run: |
           if [ -f kernel/out/arch/arm64/boot/Image.lz4 ]; then
-            mkdir -p AnyKernel3 && cp kernel/out/arch/arm64/boot/Image.lz4 AnyKernel3/Image.lz4
-            (cd AnyKernel3 && zip -r ../${{ github.event.inputs.release_name }}.zip ./*)
+            mkdir -p AnyKernel3
+            cp kernel/out/arch/arm64/boot/Image.lz4 AnyKernel3/Image.lz4
+            cd AnyKernel3
+            zip -r ../${{ github.event.inputs.release_name }}.zip ./*
+            cd ..
           fi
       - name: Build and Package Wi-Fi Module
         run: |
-          (cd kernel && make O=out ARCH=arm64 LTO=thin CROSS_COMPILE=aarch64-linux-gnu- modules_prepare && make O=out ARCH=arm64 LTO=thin CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) M=$(pwd)/drivers/staging/qcacld-3.0 modules)
+          cd kernel
+          make O=out ARCH=arm64 LTO=thin CROSS_COMPILE=aarch64-linux-gnu- modules_prepare
+          make O=out ARCH=arm64 LTO=thin CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) M=$(pwd)/drivers/staging/qcacld-3.0 modules
+          cd ..
           mkdir -p modules/vendor/lib/modules
           find kernel/out -name "wlan.ko" -exec cp -v {} modules/vendor/lib/modules/ \;
           if [ -n "$(ls -A modules/vendor/lib/modules)" ]; then
-            (cd modules && zip -r ../${{ github.event.inputs.release_name }}-modules.zip ./*)
+            cd modules
+            zip -r ../${{ github.event.inputs.release_name }}-modules.zip ./*
+            cd ..
           fi
       - name: Upload zips
         uses: actions/upload-artifact@v4
