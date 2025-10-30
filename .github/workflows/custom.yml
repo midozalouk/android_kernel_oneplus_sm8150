@@ -113,7 +113,7 @@ EOF
       working-directory: kernel
       run: |
         sed -i 's|try_to_unmap(page, ttu_flags);|try_to_unmap(page, ttu_flags, NULL);|g' mm/huge_memory.c
-        grep -C2 "try_to_unmap" mm/huge_memory.c | cat -n
+        grep -C2 "try_to_unmap" mm/huge_memory.c | cat -n || true
 
     - name: Patch hugetlbpage ptep allocation (safe/atomic, non-fatal)
       working-directory: kernel
