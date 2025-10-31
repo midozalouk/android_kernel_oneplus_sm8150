@@ -145,7 +145,6 @@ jobs:
               echo "[CI WARNING] Directory $d not found"
             fi
           }
-          # CHANGE: Removed 'drivers/clk/hisilicon' from this list
           disable_dir drivers/clk/bcm
           disable_dir drivers/clk/berlin
           disable_dir net/ipv6
@@ -170,7 +169,6 @@ jobs:
             sed -i 's|#include <net/seg6.h>|#if IS_ENABLED(CONFIG_IPV6_SEG6_BPF)\n#include <net/seg6.h>\n#endif|' net/core/filter.c
           fi
 
-      # Filter NFS/LOCKD/SUNRPC from fs
       - name: Filter NFS/LOCKD/SUNRPC from fs/Makefile
         working-directory: kernel
         run: |
@@ -184,7 +182,6 @@ jobs:
             } >> fs/Makefile
           fi
 
-      # Filter ACPI dir from drivers/Makefile
       - name: Filter ACPI dir from drivers/Makefile
         working-directory: kernel
         run: |
@@ -198,7 +195,6 @@ jobs:
             } >> drivers/Makefile
           fi
 
-      # Prepare defconfig
       - name: Prepare kernel output directory (defconfig)
         working-directory: kernel
         run: |
@@ -209,12 +205,13 @@ jobs:
           mkdir -p out
           make O=out ARCH=arm64 ${KERNEL_DEFCONFIG}
 
-      # Non-interactive config finalize and enforcement
       - name: Finalize kernel config (non-interactive + enforce)
         working-directory: kernel
         run: |
           set -euo pipefail
           export PATH="/usr/lib/llvm-18/bin:$PATH"
+          
+          # Set default config values
           cat > ../ci.defaults <<'EOF'
           CONFIG_QTI_GVM=n
           CONFIG_NR_CPUS=8
@@ -244,9 +241,15 @@ jobs:
           CONFIG_KERNEL_LZ4=n
           CONFIG_CROSS_COMPILE="aarch64-linux-gnu-"
           EOF
-
+          
+          # Resolve dependencies, which might re-enable some configs
           make O=out ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../ci.defaults
-          make O=out ARCH=arm64 olddefconfig
+
+          # --- FIX: Forcefully disable CONFIG_IPV6 after dependencies are resolved ---
+          sed -i 's/^CONFIG_IPV6=y/# CONFIG_IPV6 is not set/' out/.config
+          
+          echo "==== Snapshot of critical toggles ===="
+          egrep -E '^(CONFIG_NR_CPUS|CONFIG_IPV6|CONFIG_BPF_SYSCALL|CONFIG_NETFILTER|CONFIG_MAC80211|CONFIG_COMMON_CLK_BCM|CONFIG_ACPI|CONFIG_NFS|CONFIG_BTRFS|CONFIG_TASKSTATS|CONFIG_HUGETLB_PAGE|CONFIG_TRANSPARENT_HUGEPAGE|CONFIG_KERNEL_GZIP)=' out/.config || true
 
       - name: Prepare scripts and headers
         working-directory: kernel
@@ -273,7 +276,6 @@ jobs:
             fi
           done
 
-          # CHANGE: Removed 'drivers/clk/hisilicon' from this verification loop
           for d in drivers/clk/bcm drivers/clk/berlin net/ipv6 net/bridge net/8021q net/bluetooth net/9p net/netfilter net/mac80211 net/llc; do
             if [ -d "$d" ] && [ -f "$d/Makefile" ] && [ -s "$d/Makefile" ]; then
                 echo "Error: $d Makefile not blackholed"
@@ -293,7 +295,6 @@ jobs:
           export HOSTCC="clang-18"
           export HOSTCXX="clang++-18"
 
-          make O=out ARCH=arm64 olddefconfig
           make ${KERNEL_CMDLINE} CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j$(nproc)
           test -f out/arch/arm64/boot/Image
           cp out/arch/arm64/boot/Image ../AnyKernel3
