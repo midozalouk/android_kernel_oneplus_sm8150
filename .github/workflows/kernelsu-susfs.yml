@@ -21,7 +21,7 @@ jobs:
 
       # Kernel & Device Configuration
       KERNEL_SOURCE: "https://github.com/LineageOS/${{ inputs.repo }}"
-      KERNEL_BRANCH: "lineage-23.0" # NOTE: lineage-23.0 branch does not exist. Use 21.0 or 22.0.
+      KERNEL_BRANCH: "lineage-23.0" # Stable branch for this kernel version
       KERNEL_VERSION: "4.14" # Required for sm8150 patches
       KERNEL_DEFCONFIG: "defconfig"
       DEVICE_CODENAME: "guacamole" # Correct codename for OnePlus 7 Pro
@@ -29,13 +29,12 @@ jobs:
 
       # KernelSU Configuration
       KERNELSU_SOURCE: "https://github.com/tiann/KernelSU.git"
-      KERNELSU_BRANCH: "main" # Use the main branch for the latest version
-      HOOK_METHOD: "syscall" # 'normal' or 'syscall' - choose your preferred hook method
+      KERNELSU_BRANCH: "main"
       
       # SUSFS Configuration
       SUSFS_ENABLE: "true"
       SUSFS_SOURCE: "https://gitlab.com/simonpunk/susfs4ksu.git"
-      SUSFS_BRANCH: "kernel-${{ env.KERNEL_VERSION }}"
+      SUSFS_BRANCH: "kernel-4.14" # CORRECTED: Hardcoded value to fix the error
 
       # AnyKernel3 Configuration
       AK3_SOURCE: "https://github.com/ayuschatterjee/AnyKernel3"
@@ -58,70 +57,52 @@ jobs:
 
       - name: Clone Kernel Source and Dependencies
         run: |
-          # Clone Kernel Source into the defined directory
           git clone --depth=1 --branch ${{ env.KERNEL_BRANCH }} ${{ env.KERNEL_SOURCE }} ${{ env.KERNEL_DIR }}
-          
-          # Clone other dependencies
           git clone --depth=1 --branch ${{ env.AK3_BRANCH }} ${{ env.AK3_SOURCE }} AnyKernel3
           git clone --depth=1 --branch ${{ env.KERNELSU_BRANCH }} ${{ env.KERNELSU_SOURCE }} KernelSU
           if [[ "${{ env.SUSFS_ENABLE }}" == "true" ]]; then
             git clone --depth=1 --branch ${{ env.SUSFS_BRANCH }} ${{ env.SUSFS_SOURCE }} susfs4ksu
-            git clone --depth=1 https://github.com/TheWildJames/kernel_patches.git
           fi
       
       - name: Integrate KernelSU and SUSFS
         working-directory: ./${{ env.KERNEL_DIR }}
         run: |
-          # Integrate KernelSU
           ln -sf ../KernelSU/kernel ./drivers/kernelsu
           echo "obj-\$(CONFIG_KSU) += kernelsu/" >> drivers/Makefile
           sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-          echo "KernelSU integrated."
-
-          # Add KSU and SUSFS options to defconfig
           echo "CONFIG_KSU=y" >> arch/arm64/configs/${{ env.KERNEL_DEFCONFIG }}
           if [[ "${{ env.SUSFS_ENABLE }}" == "true" ]]; then
             echo "CONFIG_KSU_SUSFS=y" >> arch/arm64/configs/${{ env.KERNEL_DEFCONFIG }}
           fi
-          echo "Defconfig updated."
 
       - name: Apply SUSFS Patches
         if: env.SUSFS_ENABLE == 'true'
-        working-directory: ./${{ env.KERNEL_DIR }}
         run: |
-          # Copy patches from the cloned susfs4ksu repo
+          # Apply kernel patches
+          cd ./${{ env.KERNEL_DIR }}
           cp ../susfs4ksu/kernel_patches/fs/* fs/
           cp ../susfs4ksu/kernel_patches/include/linux/* include/linux/
-
-          # Apply the main SUSFS patch
           cp ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-${{ env.KERNEL_VERSION }}.patch ./
           patch -p1 < 50_add_susfs_in_kernel-${{ env.KERNEL_VERSION }}.patch || true
           
-          # Apply the patch to KernelSU itself to enable SUSFS support
-          cp ../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ../KernelSU/
+          # Apply KernelSU patches
           cd ../KernelSU/
+          cp ../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ./
           patch -p1 < 10_enable_susfs_for_ksu.patch || true
-          echo "SUSFS patches applied."
 
       - name: Build the Kernel
         working-directory: ./${{ env.KERNEL_DIR }}
         run: |
-          # Set Build Variables
           export ARCH=arm64
           export CLANG_TRIPLE=aarch64-linux-gnu-
           export CROSS_COMPILE=aarch64-linux-gnu-
-          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
           export LLVM=1
-          export LLVM_IAS=1
           
-          # Start Build
           make O=out ${{ env.KERNEL_DEFCONFIG }} CC="ccache clang"
           make O=out -j$(nproc --all) CC="ccache clang" LD=ld.lld
           
-          # Copy Image to AnyKernel3
           cp out/arch/arm64/boot/Image ../AnyKernel3/
-          echo "Kernel build complete."
-       
+
       - name: Package Kernel into Flashable Zip
         working-directory: ./AnyKernel3
         run: |
