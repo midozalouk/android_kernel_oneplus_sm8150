@@ -55,13 +55,8 @@ jobs:
           sed -i 's|try_to_unmap(page, ttu_flags);|try_to_unmap(page, ttu_flags, NULL);|g' mm/huge_memory.c
           sed -i 's/\(.*mm->nr_ptes.*\)/\/\* REMOVED_for_ARM64 \1 \*\//' mm/khugepaged.c
           if grep -qF "struct timespec now = current_time(&parent_inode->vfs_inode);" fs/btrfs/inode.c; then
-            cat <<- 'EOF' | patch -p1
-          --- a/fs/btrfs/inode.c
-          +++ b/fs/btrfs/inode.c
-          @@ -6627,7 +6627,7 @@
-          -                struct timespec now = current_time(&parent_inode->vfs_inode);
-          +                struct timespec64 now = current_time(&parent_inode->vfs_inode);
-          EOF
+            printf -- '--- a/fs/btrfs/inode.c\n+++ b/fs/btrfs/inode.c\n@@ -6627,7 +6627,7 @@\n-                struct timespec now = current_time(&parent_inode->vfs_inode);\n+                struct timespec64 now = current_time(&parent_inode->vfs_inode);\n' > btrfs.patch
+            patch -p1 < btrfs.patch
           fi
       - name: Prepare kernel config
         working-directory: ./kernel
