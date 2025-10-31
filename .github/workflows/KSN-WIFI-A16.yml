@@ -1,4 +1,4 @@
-name: Build kernel (KSN) & WIFI A16 for LineageOS 23.0
+name: Build kernel (KSN) & WIFI A16 for LineageOS 23.0 with vendor module disables
 
 on:
   workflow_dispatch:
@@ -19,6 +19,14 @@ on:
         description: "Name of the output.zip"
         required: false
         default: "OP7_KSN_wifi-LOS-A16.zip"
+      apply_kernelsu:
+        description: "Apply KernelSU patch (true/false)"
+        required: true
+        default: false
+      kernelsu_patch_url:
+        description: "KernelSU patch/setup script URL (leave empty to skip)"
+        required: false
+        default: ""
 
 jobs:
   build:
@@ -62,31 +70,58 @@ jobs:
           sudo apt-get install -y \
             clang-18 llvm-18 lld-18 gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu binutils make python3 libssl-dev \
-            build-essential bc bison flex unzip git git-lfs
+            build-essential bc bison flex unzip git git-lfs libelf-dev pahole
+
           git clone https://github.com/khalidaboelmagd/AnyKernel3
           rm -rf AnyKernel3/.git
 
       - name: KernelSU-Next setup
+        if: ${{ inputs.apply_kernelsu == 'true' && inputs.kernelsu_patch_url != '' }}
         working-directory: kernel
         run: |
           set -euo pipefail
           export PATH="/usr/lib/llvm-18/bin:$PATH"
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
+          curl -LSs "${{ inputs.kernelsu_patch_url }}" | bash -
 
-      - name: Prepare kernel config
+      - name: Prepare kernel config with disables
         working-directory: kernel
         run: |
           set -euo pipefail
           export PATH="/usr/lib/llvm-18/bin:$PATH"
           mkdir -p out
           make O=out ARCH=arm64 ${KERNEL_DEFCONFIG}
-          
-          # Use a minimal set of overrides. Add more only if needed.
+
           cat > ../ci.defaults <<'EOF'
           CONFIG_LOCALVERSION_AUTO=y
+
+          # Disable common vendor blob dependent modules
+          CONFIG_MSM_CAMERA=n
+          CONFIG_QCOM_CAMERA=n
+          CONFIG_SPECTRA_CAMERA=n
+          CONFIG_SPECTRA_EEPROM=n
+          CONFIG_DRM_MSM_OPLUS=n
+          CONFIG_OPLUS_DEVICE_INFO=n
+          CONFIG_OPLUS_PROJECT_INFO=n
+          CONFIG_VENDOR_EDIT=n
+          CONFIG_OPLUS_ARCH_EXTENDS=n
+          CONFIG_OPLUS_FEATURE_CHG_BASIC=n
+
+          CONFIG_NETFILTER=n
+          CONFIG_MAC80211=n
           EOF
-          
+
           make O=out ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../ci.defaults
+
+          # Blackhole directories with proprietary drivers missing blobs
+          for d in drivers/gpu/drm/msm/oplus net/ipv6 net/netfilter drivers/thermal/qcom; do
+            if [ -d "$d" ]; then
+              if [ -f "$d/Makefile" ]; then
+                mv -f "$d/Makefile" "$d/Makefile.bak" || true
+              fi
+              echo -e '# blackholed for missing blobs\nobj-y :=\nobj-m :=' > "$d/Makefile"
+              chmod 644 "$d/Makefile"
+            fi
+          done
 
       - name: Build kernel
         working-directory: kernel
@@ -100,7 +135,9 @@ jobs:
           export HOSTCC="clang-18"
           export HOSTCXX="clang++-18"
 
-          make ${KERNEL_CMDLINE} CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j$(nproc)
+          # Verbose build for debugging
+          make ${KERNEL_CMDLINE} V=1 CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j$(nproc)
+          
           test -f out/arch/arm64/boot/Image
           cp out/arch/arm64/boot/Image ../AnyKernel3
 
@@ -114,7 +151,8 @@ jobs:
           export HOSTCXX="clang++-18"
 
           make ${KERNEL_CMDLINE} modules_prepare CC="ccache clang-18"
-          make ${KERNEL_CMDLINE} CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" \
+
+          make ${KERNEL_CMDLINE} V=1 CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" \
             OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" \
             -j$(nproc) M=drivers/staging/qcacld-3.0 modules
 
