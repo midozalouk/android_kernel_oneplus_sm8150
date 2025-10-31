@@ -1,0 +1,62 @@
+name: Kernel Build (A16) Only (No Patches)
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo_url:
+        description: 'Kernel repository URL'
+        required: true
+        default: 'https://github.com/LineageOS/android_kernel_oneplus_sm8150'
+      kernel_branch:
+        description: 'Kernel branch'
+        required: true
+        default: 'lineage-23.0'
+      defconfig_file:
+        description: 'Kernel defconfig filename'
+        required: true
+        default: 'defconfig'
+      use_kernelsu:
+        description: 'Enable KernelSU'
+        required: true
+        default: false
+        type: boolean
+      release_name:
+        description: 'Release name for ZIP'
+        required: true
+        default: 'Kernel-Build-Test'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --fix-missing git device-tree-compiler lz4 xz-utils zlib1g-dev openjdk-17-jdk gcc g++ python3 python-is-python3 p7zip-full build-essential zip curl make sudo bc grep gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+      - name: Clone kernel
+        run: git clone --depth=1 --branch "${{ github.event.inputs.kernel_branch }}" "${{ github.event.inputs.kernel_repo_url }}" kernel
+      - name: Setup KernelSU
+        if: github.event.inputs.use_kernelsu == true
+        working-directory: ./kernel
+        run: curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s stable
+      - name: Prepare and Build Kernel
+        working-directory: ./kernel
+        run: |
+          make mrproper
+          make O=out ARCH=arm64 LTO=thin CROSS_COMPILE=aarch64-linux-gnu- ${{ github.event.inputs.defconfig_file }}
+          make O=out ARCH=arm64 LTO=thin CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
+      - name: Package Kernel Image
+        run: |
+          if [ -f kernel/out/arch/arm64/boot/Image.lz4 ]; then
+            cd kernel/out/arch/arm64/boot
+            zip ../../../../../${{ github.event.inputs.release_name }}.zip Image.lz4
+          else
+            echo "Kernel Image not found after build."
+            exit 1
+          fi
+      - name: Upload Kernel ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.release_name }}
+          path: ${{ github.event.inputs.release_name }}.zip
+          if-no-files-found: error
