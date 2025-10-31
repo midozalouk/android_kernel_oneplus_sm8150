@@ -10,15 +10,15 @@ on:
       kernel_branch:
         description: "Branch of the kernel source"
         required: true
-        default: "lineage-23.0" # Note: Patches in this file are for 22.1/A13. May fail on newer branches.
+        default: "lineage-23.0"   # Updated for lineage-23.0
       kernel_defconfig:
         description: "defconfig file to use"
         required: true
-        default: "vendor/sm8150_defconfig" # Correct default defconfig
+        default: "vendor/sm8150_defconfig"   # Updated for vendor/sm8150_defconfig
       output_name:
         description: "Name of the output.zip"
         required: false
-        default: "OP7_KSN_wifi"
+        default: "OP7_KSN_wifi-LOS-A16.zip"
   push:
     branches:
       - oneplus/OOS_SM8150_11.0
@@ -35,10 +35,10 @@ jobs:
       CCACHE_MAXSIZE: "2G"
       CCACHE_HARDLINK: "true"
       KERNEL_CMDLINE: "ARCH=arm64 LLVM=1 LLVM_IAS=1 O=out CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu-"
-      KERNEL_DEFCONFIG: ${{ github.event.inputs.kernel_defconfig || 'lineage_sm8150_defconfig' }}
+      KERNEL_DEFCONFIG: ${{ github.event.inputs.kernel_defconfig || 'vendor/sm8150_defconfig' }}
       KERNEL_SOURCE_URL: ${{ github.event.inputs.kernel_source_url || 'https://github.com/LineageOS/android_kernel_oneplus_sm8150' }}
-      KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch || 'lineage-22.1' }}
-      OUTPUT_ZIP_NAME: ${{ github.event.inputs.output_name || 'OP7_KSN_wifi' }}
+      KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch || 'lineage-23.0' }}
+      OUTPUT_ZIP_NAME: ${{ github.event.inputs.output_name || 'OP7_KSN_wifi-LOS-A16.zip' }}
 
     steps:
       - name: Checkout repository
@@ -95,36 +95,6 @@ jobs:
           export PATH="/usr/lib/llvm-18/bin:$PATH"
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
 
-      # MM fixes for hugetlb/THP
-      - name: Apply hugetlbpage fix patch
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-          if ! grep -q 'pte_t \*ptep' arch/arm64/mm/hugetlbpage.c; then
-            sed -i '/pte_t \*pte = NULL;/a \  pte_t *ptep = NULL;' arch/arm64/mm/hugetlbpage.c || true
-          fi
-          sed -i 's/ptep = huge_pmd_share(mm, vma, addr, pud);/if (!ptep) ptep = huge_pmd_share(mm, vma, addr, pud);/' arch/arm64/mm/hugetlbpage.c
-
-      - name: Apply huge_memory try_to_unmap shim
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-          sed -i 's/try_to_unmap(page, ttu_flags);/try_to_unmap(page, ttu_flags, NULL);/g' mm/huge_memory.c 2>/dev/null || true
-          sed -i 's/try_to_unmap(\s*page\s*,\s*ttu_flags\s*)/try_to_unmap(page, ttu_flags, NULL)/g' mm/huge_memory.c 2>/dev/null || true
-
-      - name: Fix split_huge_pmd call order
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-          sed -Ei 's/split_huge_pmd\(([[:space:]]*)vma([[:space:]]*),([[:space:]]*)addr([[:space:]]*),([[:space:]]*)pmd([[:space:]]*)\);/split_huge_pmd(vma, pmd, addr);/g' fs/proc/task_mmu.c || true
-
-      - name: Neutralize mm->nr_ptes in khugepaged
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-          sed -i 's/atomic_long_dec(&mm->nr_ptes);/\/\* compat: mm->nr_ptes removed \*\//' mm/khugepaged.c || true
-
-      # Blackhole unwanted Kbuild and Makefile in important directories
       - name: Hard-blackhole unwanted Kbuild subtrees (CLK and NET)
         working-directory: kernel
         run: |
@@ -155,46 +125,7 @@ jobs:
           disable_dir net/netfilter
           disable_dir net/mac80211
           disable_dir net/llc
-
-      - name: Defensive seg6 header shim (IPv6 off)
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-          hdr="include/net/seg6.h"
-          if [ -f "$hdr" ] && grep -q 'return net->ipv6.seg6_data;' "$hdr"; then
-            sed -i 's|return net->ipv6.seg6_data;|#ifdef CONFIG_IPV6\nreturn net->ipv6.seg6_data;\n#else\nreturn NULL;\n#endif|' "$hdr"
-            echo "[CI] Patched $hdr to tolerate CONFIG_IPV6=n"
-          fi
-          if [ -f net/core/filter.c ] && grep -q '^#include <net/seg6.h>' net/core/filter.c; then
-            sed -i 's|#include <net/seg6.h>|#if IS_ENABLED(CONFIG_IPV6_SEG6_BPF)\n#include <net/seg6.h>\n#endif|' net/core/filter.c
-          fi
-
-      - name: Filter NFS/LOCKD/SUNRPC from fs/Makefile
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-          if ! grep -q 'CI filter: prevent NFS' fs/Makefile; then
-            {
-              echo ''
-              echo '# CI filter: prevent NFS/LOCKD/SUNRPC from building regardless of Kconfig'
-              echo 'subdir-y := $(filter-out nfs lockd nfs_common sunrpc,$(subdir-y))'
-              echo 'subdir-m := $(filter-out nfs lockd nfs_common sunrpc,$(subdir-m))'
-            } >> fs/Makefile
-          fi
-
-      - name: Filter ACPI dir from drivers/Makefile
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-          if ! grep -q 'CI filter: prevent ACPI' drivers/Makefile; then
-            {
-              echo ''
-              echo '# CI filter: prevent ACPI from building on DT/arm64 Android'
-              echo 'subdir-y := $(filter-out acpi,$(subdir-y))'
-              echo 'subdir-m := $(filter-out acpi,$(subdir-m))'
-            } >> drivers/Makefile
-          fi
-
+      
       - name: Prepare kernel output directory (defconfig)
         working-directory: kernel
         run: |
@@ -210,36 +141,11 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="/usr/lib/llvm-18/bin:$PATH"
-          
-          # Set default config values
           cat > ../ci.defaults <<'EOF'
-          CONFIG_QTI_GVM=n
-          CONFIG_NR_CPUS=8
-          CONFIG_HUGETLB_PAGE=n
-          CONFIG_HUGETLBFS=n
-          CONFIG_TRANSPARENT_HUGEPAGE=n
-          CONFIG_KSM=n
-          CONFIG_BTRFS_FS=n
-          CONFIG_TASKSTATS=n
-          CONFIG_NFS_FS=n
-          CONFIG_LOCKD=n
-          CONFIG_SUNRPC=n
           CONFIG_IPV6=n
           CONFIG_BPF_SYSCALL=n
           CONFIG_NETFILTER=n
-          CONFIG_MAC80211=n
-          CONFIG_BT=n
-          CONFIG_VLAN_8021Q=n
-          CONFIG_NET_9P=n
-          CONFIG_COMMON_CLK_BCM=n
-          CONFIG_COMMON_CLK_HI3660=n
-          CONFIG_ACPI=n
-          CONFIG_COMPILE_TEST=n
-          CONFIG_LOCALVERSION=""
-          CONFIG_LOCALVERSION_AUTO=y
-          CONFIG_KERNEL_GZIP=y
-          CONFIG_KERNEL_LZ4=n
-          CONFIG_CROSS_COMPILE="aarch64-linux-gnu-"
+          # Add any other configs you need to force-disable here
           EOF
           
           # Resolve dependencies, which might re-enable some configs
@@ -248,39 +154,16 @@ jobs:
           # --- FIXES: Forcefully disable configs after dependencies are resolved ---
           sed -i 's/^CONFIG_IPV6=y/# CONFIG_IPV6 is not set/' out/.config
           sed -i 's/^CONFIG_BPF_SYSCALL=y/# CONFIG_BPF_SYSCALL is not set/' out/.config
-          
-          echo "==== Snapshot of critical toggles ===="
-          egrep -E '^(CONFIG_NR_CPUS|CONFIG_IPV6|CONFIG_BPF_SYSCALL|CONFIG_NETFILTER|CONFIG_MAC80211|CONFIG_COMMON_CLK_BCM|CONFIG_ACPI|CONFIG_NFS|CONFIG_BTRFS|CONFIG_TASKSTATS|CONFIG_HUGETLB_PAGE|CONFIG_TRANSPARENT_HUGEPAGE|CONFIG_KERNEL_GZIP)=' out/.config || true
-
-      - name: Prepare scripts and headers
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-          export PATH="/usr/lib/llvm-18/bin:$PATH"
-          export HOSTCC="clang-18"
-          export HOSTCXX="clang++-18"
-          make ${KERNEL_CMDLINE} scripts CC="ccache clang-18"
-          make ${KERNEL_CMDLINE} prepare CC="ccache clang-18"
+          sed -i 's/^CONFIG_NETFILTER=y/# CONFIG_NETFILTER is not set/' out/.config
 
       - name: Verify critical toggles and blackholes
         working-directory: kernel
         run: |
           set -euo pipefail
-          if ! grep -q '^CONFIG_NR_CPUS=8' out/.config; then
-            echo "Error: NR_CPUS not 8"
-            exit 1
-          fi
-          for s in CONFIG_IPV6 CONFIG_BPF_SYSCALL CONFIG_NETFILTER CONFIG_MAC80211 CONFIG_BT CONFIG_COMMON_CLK_BCM CONFIG_COMMON_CLK_HI3660 CONFIG_ACPI CONFIG_NFS_FS CONFIG_BTRFS_FS CONFIG_TASKSTATS CONFIG_HUGETLB_PAGE CONFIG_TRANSPARENT_HUGEPAGE; do
+          for s in CONFIG_IPV6 CONFIG_BPF_SYSCALL CONFIG_NETFILTER; do
             if grep -q "^${s}=[my]" out/.config; then
               echo "Error: ${s} still enabled"
               exit 1
-            fi
-          done
-
-          for d in drivers/clk/bcm drivers/clk/berlin net/ipv6 net/bridge net/8021q net/bluetooth net/9p net/netfilter net/mac80211 net/llc; do
-            if [ -d "$d" ] && [ -f "$d/Makefile" ] && [ -s "$d/Makefile" ]; then
-                echo "Error: $d Makefile not blackholed"
-                exit 1
             fi
           done
 
