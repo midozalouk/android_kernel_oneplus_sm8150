@@ -1,4 +1,4 @@
-name: Build kernel (KSN) & WIFI A16
+name: Build kernel (KSN) & WIFI A16 for LineageOS 23.0
 
 on:
   workflow_dispatch:
@@ -10,21 +10,15 @@ on:
       kernel_branch:
         description: "Branch of the kernel source"
         required: true
-        default: "lineage-23.0"   # Updated for lineage-23.0
+        default: "lineage-23.0"
       kernel_defconfig:
         description: "defconfig file to use"
         required: true
-        default: "vendor/sm8150_defconfig"   # Updated for vendor/sm8150_defconfig
+        default: "vendor/sm8150_defconfig"
       output_name:
         description: "Name of the output.zip"
         required: false
         default: "OP7_KSN_wifi-LOS-A16.zip"
-  push:
-    branches:
-      - oneplus/OOS_SM8150_11.0
-  pull_request:
-    branches:
-      - oneplus/OOS_SM8150_11.0
 
 jobs:
   build:
@@ -33,8 +27,7 @@ jobs:
       CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
       CCACHE_NOHASHDIR: "true"
       CCACHE_MAXSIZE: "2G"
-      CCACHE_HARDLINK: "true"
-      KERNEL_CMDLINE: "ARCH=arm64 LLVM=1 LLVM_IAS=1 O=out CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu-"
+      KERNEL_CMDLINE: "ARCH=arm64 LLVM=1 LLVM_IAS=1 O=out CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu-"
       KERNEL_DEFCONFIG: ${{ github.event.inputs.kernel_defconfig || 'vendor/sm8150_defconfig' }}
       KERNEL_SOURCE_URL: ${{ github.event.inputs.kernel_source_url || 'https://github.com/LineageOS/android_kernel_oneplus_sm8150' }}
       KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch || 'lineage-23.0' }}
@@ -60,33 +53,18 @@ jobs:
       - name: Cleanup space
         run: |
           set -euo pipefail
-          sudo rm -rf /opt/ghc || true
-          sudo rm -rf "/usr/local/share/boost" || true
-          sudo rm -rf /usr/share/dotnet || true
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+          sudo rm -rf /opt/ghc /usr/local/share/boost /usr/share/dotnet "$AGENT_TOOLSDIRECTORY" || true
 
-      - name: Install dependencies (LLVM 18 + cross-binutils)
+      - name: Install dependencies
         run: |
           set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y \
-            clang-18 llvm-18 lld-18 \
-            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
-            binutils-aarch64-linux-gnu binutils \
-            make python3 libssl-dev build-essential bc bison flex unzip \
-            ca-certificates xz-utils mkbootimg cpio device-tree-compiler git git-lfs
+            clang-18 llvm-18 lld-18 gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu binutils make python3 libssl-dev \
+            build-essential bc bison flex unzip git git-lfs
           git clone https://github.com/khalidaboelmagd/AnyKernel3
           rm -rf AnyKernel3/.git
-
-      - name: Get Version
-        id: get_version
-        run: |
-          set -euo pipefail
-          cd kernel
-          git fetch --unshallow || true
-          COUNT="$(git rev-list --count HEAD || echo 0)"
-          echo "VERSION=$((COUNT + 10200))" >> "$GITHUB_OUTPUT"
-          cd ..
 
       - name: KernelSU-Next setup
         working-directory: kernel
@@ -95,77 +73,20 @@ jobs:
           export PATH="/usr/lib/llvm-18/bin:$PATH"
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
 
-      - name: Hard-blackhole unwanted Kbuild subtrees (CLK and NET)
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-          disable_dir() {
-            local d="$1"
-            if [ -d "$d" ]; then
-              if [ -f "$d/Makefile" ]; then
-                mv -f "$d/Makefile" "$d/Makefile.bak" || true
-              fi
-              if [ -f "$d/Kbuild" ]; then
-                mv -f "$d/Kbuild" "$d/Kbuild.bak" || true
-              fi
-              echo -e '# disabled in CI for sm8150\nobj-y :=\nobj-m :=' > "$d/Makefile"
-              chmod 644 "$d/Makefile"
-              echo "[CI] Blackholed $d"
-            else
-              echo "[CI WARNING] Directory $d not found"
-            fi
-          }
-          disable_dir drivers/clk/bcm
-          disable_dir drivers/clk/berlin
-          disable_dir net/ipv6
-          disable_dir net/bridge
-          disable_dir net/8021q
-          disable_dir net/bluetooth
-          disable_dir net/9p
-          disable_dir net/netfilter
-          disable_dir net/mac80211
-          disable_dir net/llc
-      
-      - name: Prepare kernel output directory (defconfig)
+      - name: Prepare kernel config
         working-directory: kernel
         run: |
           set -euo pipefail
           export PATH="/usr/lib/llvm-18/bin:$PATH"
-          export HOSTCC="clang-18"
-          export HOSTCXX="clang++-18"
           mkdir -p out
           make O=out ARCH=arm64 ${KERNEL_DEFCONFIG}
-
-      - name: Finalize kernel config (non-interactive + enforce)
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-          export PATH="/usr/lib/llvm-18/bin:$PATH"
+          
+          # Use a minimal set of overrides. Add more only if needed.
           cat > ../ci.defaults <<'EOF'
-          CONFIG_IPV6=n
-          CONFIG_BPF_SYSCALL=n
-          CONFIG_NETFILTER=n
-          # Add any other configs you need to force-disable here
+          CONFIG_LOCALVERSION_AUTO=y
           EOF
           
-          # Resolve dependencies, which might re-enable some configs
           make O=out ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../ci.defaults
-
-          # --- FIXES: Forcefully disable configs after dependencies are resolved ---
-          sed -i 's/^CONFIG_IPV6=y/# CONFIG_IPV6 is not set/' out/.config
-          sed -i 's/^CONFIG_BPF_SYSCALL=y/# CONFIG_BPF_SYSCALL is not set/' out/.config
-          sed -i 's/^CONFIG_NETFILTER=y/# CONFIG_NETFILTER is not set/' out/.config
-
-      - name: Verify critical toggles and blackholes
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-          for s in CONFIG_IPV6 CONFIG_BPF_SYSCALL CONFIG_NETFILTER; do
-            if grep -q "^${s}=[my]" out/.config; then
-              echo "Error: ${s} still enabled"
-              exit 1
-            fi
-          done
 
       - name: Build kernel
         working-directory: kernel
@@ -201,30 +122,14 @@ jobs:
           sudo find out/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \;
           sudo chown -R "$(id -u)":"$(id -g)" ../modules
 
-      - name: Package Kernel
+      - name: Package Kernel and Wi-Fi Modules
         run: |
           set -euo pipefail
           cd AnyKernel3
-          zip -r ../${{ env.OUTPUT_ZIP_NAME }}.zip *
+          zip -r ../${OUTPUT_ZIP_NAME}.zip *
+          cd ../modules
+          zip -r ../${OUTPUT_ZIP_NAME}-modules.zip *
           cd ..
-
-      - name: Package Wi-Fi Module
-        run: |
-          set -euo pipefail
-          if [ ! -d "modules/vendor/lib/modules" ] || ! ls modules/vendor/lib/modules/*.ko >/dev/null 2>&1; then
-            echo "Error: No Wi-Fi modules found to package!"
-            exit 1
-          fi
-          cd modules
-          zip -r ../${{ env.OUTPUT_ZIP_NAME }}-modules.zip *
-          cd ..
-
-      - name: Upload kernel build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-out
-          path: kernel/out
-          if-no-files-found: warn
 
       - name: Upload zips
         uses: actions/upload-artifact@v4
