@@ -23,7 +23,7 @@ jobs:
       KERNEL_SOURCE: "https://github.com/LineageOS/${{ inputs.repo }}"
       KERNEL_BRANCH: "lineage-23.0" # Stable branch for this kernel version
       KERNEL_VERSION: "4.14" # Required for sm8150 patches
-      KERNEL_DEFCONFIG: "defconfig"
+      KERNEL_DEFCONFIG: "vendor/sm8150_defconfig"
       DEVICE_CODENAME: "guacamole" # Correct codename for OnePlus 7 Pro
       KERNEL_DIR: "device_kernel" # Define a consistent kernel directory
 
