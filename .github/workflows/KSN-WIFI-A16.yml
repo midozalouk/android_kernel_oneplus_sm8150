@@ -245,8 +245,9 @@ jobs:
           # Resolve dependencies, which might re-enable some configs
           make O=out ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../ci.defaults
 
-          # --- FIX: Forcefully disable CONFIG_IPV6 after dependencies are resolved ---
+          # --- FIXES: Forcefully disable configs after dependencies are resolved ---
           sed -i 's/^CONFIG_IPV6=y/# CONFIG_IPV6 is not set/' out/.config
+          sed -i 's/^CONFIG_BPF_SYSCALL=y/# CONFIG_BPF_SYSCALL is not set/' out/.config
           
           echo "==== Snapshot of critical toggles ===="
           egrep -E '^(CONFIG_NR_CPUS|CONFIG_IPV6|CONFIG_BPF_SYSCALL|CONFIG_NETFILTER|CONFIG_MAC80211|CONFIG_COMMON_CLK_BCM|CONFIG_ACPI|CONFIG_NFS|CONFIG_BTRFS|CONFIG_TASKSTATS|CONFIG_HUGETLB_PAGE|CONFIG_TRANSPARENT_HUGEPAGE|CONFIG_KERNEL_GZIP)=' out/.config || true
