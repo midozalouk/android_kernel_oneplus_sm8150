@@ -1,4 +1,4 @@
-name: Build kernel (KSN) & WIFI A16 for LineageOS 23.0
+name: Build kernel (KSN) & WIFI A16 for LineageOS 23.0 (Debug)
 
 on:
   workflow_dispatch:
@@ -59,9 +59,11 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -y
+          # FIX: Added libelf-dev and pahole, which are common modern kernel dependencies
           sudo apt-get install -y \
             clang-18 llvm-18 lld-18 gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu binutils make python3 libssl-dev \
+            libelf-dev pahole \
             build-essential bc bison flex unzip git git-lfs
           git clone https://github.com/khalidaboelmagd/AnyKernel3
           rm -rf AnyKernel3/.git
@@ -81,7 +83,6 @@ jobs:
           mkdir -p out
           make O=out ARCH=arm64 ${KERNEL_DEFCONFIG}
           
-          # Use a minimal set of overrides. Add more only if needed.
           cat > ../ci.defaults <<'EOF'
           CONFIG_LOCALVERSION_AUTO=y
           EOF
@@ -100,7 +101,8 @@ jobs:
           export HOSTCC="clang-18"
           export HOSTCXX="clang++-18"
 
-          make ${KERNEL_CMDLINE} CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j$(nproc)
+          # FIX: Added V=1 for verbose output and -j1 for single-threaded build to easily find errors
+          make ${KERNEL_CMDLINE} V=1 CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j1
           test -f out/arch/arm64/boot/Image
           cp out/arch/arm64/boot/Image ../AnyKernel3
 
@@ -114,9 +116,9 @@ jobs:
           export HOSTCXX="clang++-18"
 
           make ${KERNEL_CMDLINE} modules_prepare CC="ccache clang-18"
-          make ${KERNEL_CMDLINE} CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" \
+          make ${KERNEL_CMDLINE} V=1 CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" \
             OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" \
-            -j$(nproc) M=drivers/staging/qcacld-3.0 modules
+            -j1 M=drivers/staging/qcacld-3.0 modules
 
           sudo mkdir -p ../modules/vendor/lib/modules
           sudo find out/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \;
