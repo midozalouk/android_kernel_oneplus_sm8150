@@ -1,0 +1,126 @@
+name: Build kernel (NoVendor) for OnePlus 7/7 Pro - LineageOS 23 / Android 16
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_source_url:
+        description: "Kernel source repository"
+        required: true
+        default: "https://github.com/LineageOS/android_kernel_oneplus_sm8150"
+      kernel_branch:
+        description: "Kernel branch"
+        required: true
+        default: "lineage-23.0"
+      output_name:
+        description: "Output name (ZIP)"
+        required: false
+        default: "OP7_NOVENDOR_A16.zip"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      LLVM: 1
+      LLVM_IAS: 1
+      CC: clang
+      CROSS_COMPILE: aarch64-linux-gnu-
+      CLANG_TRIPLE: aarch64-linux-gnu-
+      OUT_DIR: out
+      OUTPUT_ZIP_NAME: ${{ github.event.inputs.output_name }}
+
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 --branch "${{ github.event.inputs.kernel_branch }}" \
+            "${{ github.event.inputs.kernel_source_url }}" kernel
+          cd kernel
+          git submodule update --init --recursive
+          cd ..
+
+      - name: Install build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential bc bison flex libssl-dev \
+            clang-18 llvm-18 lld-18 gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu libelf-dev pahole git python3 unzip zip
+
+          git clone https://github.com/khalidaboelmagd/AnyKernel3
+          rm -rf AnyKernel3/.git
+
+      - name: Create no-vendor defconfig
+        working-directory: kernel
+        run: |
+          mkdir -p out
+          make O=out ARCH=arm64 vendor/sm8150_defconfig
+
+          # Disable vendor blob dependencies
+          cat > ../novendor.defaults <<'EOF'
+          CONFIG_LOCALVERSION_AUTO=y
+          CONFIG_MSM_CAMERA=n
+          CONFIG_QCOM_CAMERA=n
+          CONFIG_SPECTRA_CAMERA=n
+          CONFIG_SPECTRA_EEPROM=n
+          CONFIG_DRM_MSM_OPLUS=n
+          CONFIG_OPLUS_DEVICE_INFO=n
+          CONFIG_OPLUS_PROJECT_INFO=n
+          CONFIG_VENDOR_EDIT=n
+          CONFIG_OPLUS_ARCH_EXTENDS=n
+          CONFIG_OPLUS_FEATURE_CHG_BASIC=n
+          CONFIG_OPLUS_FEATURE_SENSOR=n
+          CONFIG_NETFILTER=n
+          CONFIG_MAC80211=n
+          CONFIG_TOUCHSCREEN_OPLUS=n
+          CONFIG_SOUND_OPLUS=n
+          EOF
+
+          make O=out ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../novendor.defaults
+
+          # Save as new defconfig
+          cp out/.config arch/arm64/configs/oneplus7_novendor_defconfig
+
+      - name: Blackhole vendor directories
+        working-directory: kernel
+        run: |
+          for d in \
+            drivers/gpu/drm/msm/oplus \
+            drivers/misc/oplus* \
+            drivers/soc/oplus \
+            drivers/input/oplus* \
+            drivers/oneplus* \
+            drivers/staging/qcacld-3.0 \
+            drivers/media/platform/msm/camera \
+            drivers/thermal/qcom \
+            sound/soc/oplus* \
+            net/netfilter; do
+            if [ -d "$d" ]; then
+              echo -e '# Blackholed due to missing vendor blobs\nobj-y :=\nobj-m :=' > "$d/Makefile"
+            fi
+          done
+
+      - name: Build kernel (no vendor)
+        working-directory: kernel
+        run: |
+          export PATH="/usr/lib/llvm-18/bin:$PATH"
+          make O=out ARCH=arm64 oneplus7_novendor_defconfig
+          make O=out -j$(nproc) KCFLAGS=-Wno-error
+
+          test -f out/arch/arm64/boot/Image
+          cp out/arch/arm64/boot/Image ../AnyKernel3/zImage
+
+      - name: Package flashable ZIP
+        run: |
+          cd AnyKernel3
+          zip -r ../${OUTPUT_ZIP_NAME}.zip *
+          cd ..
+
+      - name: Upload kernel ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-output
+          path: ${{ env.OUTPUT_ZIP_NAME }}.zip
+          if-no-files-found: error
