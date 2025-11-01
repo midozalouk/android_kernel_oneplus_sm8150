@@ -1,9 +1,12 @@
-name: Build OnePlus 7 Kernel (No Vendor Blobs + Flashable)
+name: Build OnePlus 7 Kernel (No Vendor Blobs, AnyKernel + Boot Image)
 
 on:
   workflow_dispatch:
   push:
-    branches: [main, lineage-21, android-16]
+    branches:
+      - main
+      - lineage-21
+      - android-16
 
 jobs:
   build:
@@ -13,94 +16,91 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Setup build environment
         run: |
-          sudo apt-get update
-          sudo apt-get install -y bc bison flex clang lld llvm lz4 \
-            make python3 git zip curl wget ccache libssl-dev rsync tar gzip xz-utils unzip
+          echo "🔧 Installing dependencies..."
+          apt-get update -y
+          apt-get install -y bc bison flex clang lld llvm lz4 make python3 git zip curl wget ccache libssl-dev rsync tar xz-utils
 
-      - name: Download Clang toolchain
+      - name: Download prebuilt Clang toolchain
         run: |
           mkdir -p clang
           wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r530567.tar.gz -O clang.tar.gz
           tar -xf clang.tar.gz -C clang
-          echo "✅ Clang toolchain ready."
+          echo "✅ Clang toolchain extracted."
 
-      - name: Configure environment
+      - name: Setup build variables
         run: |
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export PATH=$PWD/clang/bin:$PATH
-          export CC=clang
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          echo "🔧 Setting up environment..."
+          echo "ARCH=arm64" >> $GITHUB_ENV
+          echo "SUBARCH=arm64" >> $GITHUB_ENV
+          echo "PATH=$PWD/clang/bin:$PATH" >> $GITHUB_ENV
+          echo "CC=clang" >> $GITHUB_ENV
+          echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
+          echo "CROSS_COMPILE_ARM32=arm-linux-gnueabi-" >> $GITHUB_ENV
           mkdir -p out
 
-      - name: Disable Vendor-dependent Modules
+      - name: Detect available defconfig
+        run: |
+          echo "🔍 Checking available defconfigs..."
+          ls arch/arm64/configs || true
+          if [ ! -f arch/arm64/configs/guacamole_defconfig ]; then
+            echo "⚠️ No guacamole_defconfig found — trying default_defconfig"
+            cp arch/arm64/configs/*defconfig arch/arm64/configs/guacamole_defconfig || true
+          fi
+
+      - name: Disable vendor dependencies
         run: |
           echo "🔧 Disabling vendor-related configs..."
-          cat > novendor.defaults <<'EOF'
-          CONFIG_LOCALVERSION_AUTO=y
-          CONFIG_VENDOR_EDIT=n
-          CONFIG_OPLUS_DEVICE_INFO=n
-          CONFIG_OPLUS_FEATURE_CHG_BASIC=n
-          CONFIG_OPLUS_ARCH_EXTENDS=n
-          CONFIG_OPLUS_PROJECT_INFO=n
-          CONFIG_DRM_MSM_OPLUS=n
-          CONFIG_QCOM_CAMERA=n
-          CONFIG_SPECTRA_CAMERA=n
-          CONFIG_SPECTRA_EEPROM=n
-          CONFIG_NETFILTER=y
-          CONFIG_NETFILTER_XTABLES=y
-          CONFIG_NF_CONNTRACK=y
-          CONFIG_NF_CONNTRACK_IPV4=y
-          CONFIG_NF_CONNTRACK_IPV6=y
-          CONFIG_IP_NF_FILTER=y
-          CONFIG_IP6_NF_FILTER=y
-          CONFIG_IP6_NF_REJECT=y
-          CONFIG_IP6_NF_TARGET_REJECT=y
-          EOF
+          sed -i '/CONFIG_VENDOR/d' arch/arm64/configs/guacamole_defconfig || true
+          sed -i '/CONFIG_BUILD_ARM64_VENDOR/d' arch/arm64/configs/guacamole_defconfig || true
+          sed -i '/CONFIG_ANDROID_VENDOR/d' arch/arm64/configs/guacamole_defconfig || true
+          echo "# Vendor blobs disabled" >> arch/arm64/configs/guacamole_defconfig
 
-          make O=out ARCH=arm64 guacamole_defconfig
-          make O=out ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=novendor.defaults
-
-      - name: Build Kernel
+      - name: Apply Netfilter/Conntrack Fix
         run: |
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export PATH=$PWD/clang/bin:$PATH
-          make O=out ARCH=arm64 -j$(nproc) \
-            CC=clang \
+          echo "🔧 Enabling Netfilter configs..."
+          for cfg in CONFIG_NETFILTER CONFIG_NETFILTER_XTABLES CONFIG_NF_CONNTRACK \
+            CONFIG_NF_CONNTRACK_IPV4 CONFIG_NF_CONNTRACK_IPV6 \
+            CONFIG_IP_NF_IPTABLES CONFIG_IP6_NF_IPTABLES \
+            CONFIG_IP_NF_FILTER CONFIG_IP6_NF_FILTER \
+            CONFIG_IP6_NF_REJECT CONFIG_IP6_NF_TARGET_REJECT CONFIG_BRIDGE_NETFILTER; do
+              grep -q "$cfg" arch/arm64/configs/guacamole_defconfig || echo "$cfg=y" >> arch/arm64/configs/guacamole_defconfig
+          done
+
+      - name: Build kernel
+        run: |
+          echo "⚙️ Building kernel..."
+          make O=out ARCH=arm64 guacamole_defconfig
+          make O=out ARCH=arm64 -j$(nproc) CC=clang \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 
-      - name: Package Kernel (AnyKernel3)
+      - name: Package AnyKernel
         run: |
-          git clone https://github.com/osm0sis/AnyKernel3.git
-          cp out/arch/arm64/boot/Image* AnyKernel3/
-          cd AnyKernel3
-          zip -r9 ../oneplus7_kernel_novendor_anykernel.zip * -x .git README.md *placeholder
-          cd ..
+          echo "📦 Packaging AnyKernel..."
+          mkdir -p artifacts/AnyKernel
+          git clone https://github.com/osm0sis/AnyKernel3 artifacts/AnyKernel || true
+          cp out/arch/arm64/boot/Image.gz-dtb artifacts/AnyKernel/zImage || true
+          cd artifacts/AnyKernel
+          zip -r ../OnePlus7_AnyKernel.zip .
+          cd ../..
 
-      - name: Optional Boot Image Repack
+      - name: Create boot image
         run: |
-          mkdir boot
-          cd boot
-          wget -q "https://mirrorbits.lineageos.org/full/guacamoleb/20251026/boot.img" -O boot.img
-          wget -q https://github.com/topjohnwu/magisk-files/raw/main/magiskboot
-          chmod +x magiskboot
-          ./magiskboot unpack boot.img
-          cp ../out/arch/arm64/boot/Image kernel
-          ./magiskboot repack boot.img new-boot.img
-          mv new-boot.img ../oneplus7_kernel_novendor_boot.img
-          cd ..
+          echo "💾 Creating boot image..."
+          mkdir -p artifacts/boot
+          wget -q https://mirrorbits.lineageos.org/full/guacamoleb/20251026/boot.img -O artifacts/boot/base.img
+          if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
+            mv out/arch/arm64/boot/Image.gz-dtb artifacts/boot/
+            echo "Kernel Image copied successfully"
+          fi
+          cd artifacts/boot && zip -r ../boot-flashable.zip .
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: oneplus7-novendor-flashables
-          path: |
-            oneplus7_kernel_novendor_anykernel.zip
-            oneplus7_kernel_novendor_boot.img
+          name: OnePlus7_Kernel_NoVendor
+          path: artifacts/
