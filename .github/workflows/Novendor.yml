@@ -1,38 +1,46 @@
-name: Build kernel (NoVendor) for OnePlus 7/7 Pro - LineageOS 23 / Android 16
+name: OnePlus7 Kernel Build (No Vendor) + AnyKernel + Boot.img Repack
 
 on:
   workflow_dispatch:
     inputs:
       kernel_source_url:
         description: "Kernel source repository"
-        required: true
+        required: false
         default: "https://github.com/LineageOS/android_kernel_oneplus_sm8150"
       kernel_branch:
-        description: "Kernel branch"
-        required: true
-        default: "lineage-23.0"
-      output_name:
-        description: "Output name (ZIP)"
+        description: "Branch of kernel source"
         required: false
-        default: "OP7_NOVENDOR_A16.zip"
+        default: "lineage-23.0"
+      kernel_defconfig:
+        description: "Defconfig file to use"
+        required: false
+        default: "vendor/sm8150_defconfig"
+      bootimg_url:
+        description: "Boot.img URL (base for repack)"
+        required: false
+        default: "https://mirrorbits.lineageos.org/full/guacamoleb/20251026/boot.img"
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     env:
       ARCH: arm64
       SUBARCH: arm64
-      LLVM: 1
-      LLVM_IAS: 1
-      CC: clang
-      CROSS_COMPILE: aarch64-linux-gnu-
-      CLANG_TRIPLE: aarch64-linux-gnu-
+      KERNEL_NAME: OnePlus7_A16_NoVendor
       OUT_DIR: out
-      OUTPUT_ZIP_NAME: ${{ github.event.inputs.output_name }}
+      CCACHE_MAXSIZE: 2G
+      PATH: /usr/lib/llvm-18/bin:$PATH
 
     steps:
-      - name: Checkout workflow repo
+      - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison flex clang-18 lld-18 llvm-18 make git wget curl zip unzip \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu libssl-dev ccache
 
       - name: Clone kernel source
         run: |
@@ -42,85 +50,84 @@ jobs:
           git submodule update --init --recursive
           cd ..
 
-      - name: Install build dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y build-essential bc bison flex libssl-dev \
-            clang-18 llvm-18 lld-18 gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu libelf-dev pahole git python3 unzip zip
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          max-size: 2G
 
-          git clone https://github.com/khalidaboelmagd/AnyKernel3
-          rm -rf AnyKernel3/.git
-
-      - name: Create no-vendor defconfig
+      - name: Configure kernel (disable vendor blobs)
         working-directory: kernel
         run: |
           mkdir -p out
-          make O=out ARCH=arm64 vendor/sm8150_defconfig
-
-          # Disable vendor blob dependencies
-          cat > ../novendor.defaults <<'EOF'
+          make O=out ARCH=arm64 ${{ github.event.inputs.kernel_defconfig }}
+          cat > ../ci.defaults <<'EOF'
           CONFIG_LOCALVERSION_AUTO=y
+          CONFIG_VENDOR_EDIT=n
+          CONFIG_OPLUS_DEVICE_INFO=n
           CONFIG_MSM_CAMERA=n
           CONFIG_QCOM_CAMERA=n
-          CONFIG_SPECTRA_CAMERA=n
-          CONFIG_SPECTRA_EEPROM=n
-          CONFIG_DRM_MSM_OPLUS=n
-          CONFIG_OPLUS_DEVICE_INFO=n
-          CONFIG_OPLUS_PROJECT_INFO=n
-          CONFIG_VENDOR_EDIT=n
-          CONFIG_OPLUS_ARCH_EXTENDS=n
-          CONFIG_OPLUS_FEATURE_CHG_BASIC=n
-          CONFIG_OPLUS_FEATURE_SENSOR=n
           CONFIG_NETFILTER=n
           CONFIG_MAC80211=n
-          CONFIG_TOUCHSCREEN_OPLUS=n
-          CONFIG_SOUND_OPLUS=n
           EOF
+          make O=out ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../ci.defaults
 
-          make O=out ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../novendor.defaults
-
-          # Save as new defconfig
-          cp out/.config arch/arm64/configs/oneplus7_novendor_defconfig
-
-      - name: Blackhole vendor directories
+      - name: Build kernel
         working-directory: kernel
         run: |
-          for d in \
-            drivers/gpu/drm/msm/oplus \
-            drivers/misc/oplus* \
-            drivers/soc/oplus \
-            drivers/input/oplus* \
-            drivers/oneplus* \
-            drivers/staging/qcacld-3.0 \
-            drivers/media/platform/msm/camera \
-            drivers/thermal/qcom \
-            sound/soc/oplus* \
-            net/netfilter; do
-            if [ -d "$d" ]; then
-              echo -e '# Blackholed due to missing vendor blobs\nobj-y :=\nobj-m :=' > "$d/Makefile"
-            fi
-          done
+          make O=out ARCH=arm64 CC="ccache clang-18" LD="ld.lld-18" -j$(nproc)
+          ls out/arch/arm64/boot/
 
-      - name: Build kernel (no vendor)
-        working-directory: kernel
+      - name: Verify kernel output
         run: |
-          export PATH="/usr/lib/llvm-18/bin:$PATH"
-          make O=out ARCH=arm64 oneplus7_novendor_defconfig
-          make O=out -j$(nproc) KCFLAGS=-Wno-error
+          test -f kernel/out/arch/arm64/boot/Image || exit 1
 
-          test -f out/arch/arm64/boot/Image
-          cp out/arch/arm64/boot/Image ../AnyKernel3/zImage
-
-      - name: Package flashable ZIP
+      # -------------------------------------------------------------------
+      # ANYKERNEL3 PACKAGE
+      # -------------------------------------------------------------------
+      - name: Clone AnyKernel3
         run: |
+          git clone https://github.com/osm0sis/AnyKernel3.git
           cd AnyKernel3
-          zip -r ../${OUTPUT_ZIP_NAME}.zip *
+          rm -rf *.img *.zip
+          sed -i 's|device.name1=.*|device.name1=guacamole|' anykernel.sh
+          sed -i 's|device.name2=.*|device.name2=guacamoleb|' anykernel.sh
+          sed -i 's|do.devicecheck=1|do.devicecheck=0|' anykernel.sh
           cd ..
 
-      - name: Upload kernel ZIP
+      - name: Package AnyKernel3 ZIP
+        run: |
+          cp kernel/out/arch/arm64/boot/Image* AnyKernel3/
+          cd AnyKernel3
+          zip -r9 ../${{ env.KERNEL_NAME }}_Anykernel.zip ./*
+
+      # -------------------------------------------------------------------
+      # BOOT IMAGE REPACK
+      # -------------------------------------------------------------------
+      - name: Download base boot image
+        run: |
+          mkdir -p boot
+          wget -O boot/base_boot.img "${{ github.event.inputs.bootimg_url }}"
+
+      - name: Clone Android Image Kitchen
+        run: |
+          git clone https://github.com/osm0sis/Android-Image-Kitchen.git aik
+
+      - name: Repack boot image with new kernel
+        run: |
+          cd aik
+          ./unpackimg.sh ../boot/base_boot.img
+          cp ../kernel/out/arch/arm64/boot/Image* split_img/
+          ./repackimg.sh
+          mv image-new.img ../${{ env.KERNEL_NAME }}_boot.img
+          cd ..
+
+      # -------------------------------------------------------------------
+      # UPLOAD ARTIFACTS
+      # -------------------------------------------------------------------
+      - name: Upload outputs
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-output
-          path: ${{ env.OUTPUT_ZIP_NAME }}.zip
-          if-no-files-found: error
+          name: ${{ env.KERNEL_NAME }}_Outputs
+          path: |
+            ${{ env.KERNEL_NAME }}_Anykernel.zip
+            ${{ env.KERNEL_NAME }}_boot.img
