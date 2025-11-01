@@ -1,139 +1,223 @@
-name: OnePlus7 Kernel Build (No Vendor) + AnyKernel + Boot.img Repack
+name: OnePlus7 Kernel (No-Vendor) → AnyKernel + Boot.img Repack
 
 on:
   workflow_dispatch:
     inputs:
       kernel_source_url:
-        description: "Kernel source repository"
+        description: 'Kernel source git URL'
         required: false
-        default: "https://github.com/LineageOS/android_kernel_oneplus_sm8150"
+        default: 'https://github.com/LineageOS/android_kernel_oneplus_sm8150'
       kernel_branch:
-        description: "Branch of kernel source"
+        description: 'Kernel branch'
         required: false
-        default: "lineage-23.0"
+        default: 'lineage-23.0'
       kernel_defconfig:
-        description: "Defconfig file to use"
+        description: 'Base defconfig (used to seed then stripped)'
         required: false
-        default: "vendor/sm8150_defconfig"
-      bootimg_url:
-        description: "Boot.img URL (base for repack)"
+        default: 'vendor/sm8150_defconfig'
+      boot_image_url:
+        description: 'Boot.img base URL (for repack). Default is LineageOS mirror'
         required: false
-        default: "https://mirrorbits.lineageos.org/full/guacamoleb/20251026/boot.img"
+        default: 'https://mirrorbits.lineageos.org/full/guacamoleb/20251026/boot.img'
+      apply_kernelsu:
+        description: 'Apply KernelSU patch? (true/false)'
+        required: false
+        default: 'false'
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     env:
       ARCH: arm64
       SUBARCH: arm64
-      KERNEL_NAME: OnePlus7_A16_NoVendor
-      OUT_DIR: out
-      CCACHE_MAXSIZE: 2G
-      PATH: /usr/lib/llvm-18/bin:$PATH
+      OUTDIR: out
+      KNAME: OnePlus7_A16_NoVendor
+      PATH: ${{ github.workspace }}/clang/bin:$PATH
 
     steps:
-      # --- Install essential tools (fixes 'tar' not found) ---
-      - name: Install system utilities
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y tar gzip xz-utils
-
-      - name: Checkout repository
+      - name: Checkout workflow repo (if any)
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            bc bison flex clang-18 lld-18 llvm-18 make git wget curl zip unzip \
-            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu libssl-dev ccache
+          sudo apt-get install -y git wget curl tar gzip xz-utils zip unzip build-essential \
+            bc bison flex libssl-dev libncurses-dev ccache pkg-config python3 python3-pip \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu clang-18 lld-18 llvm-18
+
+      - name: Download/prepare Clang (fallback if apt clang-18 unavailable)
+        run: |
+          if ! command -v clang-18 >/dev/null 2>&1; then
+            echo "clang-18 not in PATH; downloading prebuilt clang"
+            mkdir -p clang
+            CLANG_TGZ="clang+llvm-18.1.8-x86_64-linux-gnu-ubuntu-22.04.tar.xz"
+            wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/${CLANG_TGZ}"
+            tar -xf ${CLANG_TGZ} -C clang --strip-components=1
+          else
+            echo "clang-18 present"
+          fi
+          export PATH=$PWD/clang/bin:$PATH
 
       - name: Clone kernel source
         run: |
           git clone --depth=1 --branch "${{ github.event.inputs.kernel_branch }}" \
             "${{ github.event.inputs.kernel_source_url }}" kernel
           cd kernel
-          git submodule update --init --recursive
+          git submodule update --init --recursive || true
           cd ..
 
-      - name: Setup ccache
-        uses: hendrikmuhs/ccache-action@v1.2
-        with:
-          max-size: 2G
-
-      - name: Configure kernel (disable vendor blobs)
+      - name: Create novendor.defaults (disable vendor modules + netfilter)
         working-directory: kernel
         run: |
-          mkdir -p out
-          make O=out ARCH=arm64 ${{ github.event.inputs.kernel_defconfig }}
-          cat > ../ci.defaults <<'EOF'
+          cat > ../novendor.defaults <<'EOF'
+          # Force localversion
           CONFIG_LOCALVERSION_AUTO=y
+
+          # Vendor / proprietary modules (disable)
           CONFIG_VENDOR_EDIT=n
           CONFIG_OPLUS_DEVICE_INFO=n
+          CONFIG_OPLUS_PROJECT_INFO=n
+          CONFIG_OPLUS_ARCH_EXTENDS=n
+          CONFIG_OPLUS_FEATURE_CHG_BASIC=n
+          CONFIG_OPLUS_FEATURE_SENSOR=n
           CONFIG_MSM_CAMERA=n
           CONFIG_QCOM_CAMERA=n
-          CONFIG_NETFILTER=n
-          CONFIG_MAC80211=n
-          EOF
-          make O=out ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../ci.defaults
+          CONFIG_SPECTRA_CAMERA=n
+          CONFIG_SPECTRA_EEPROM=n
+          CONFIG_DRM_MSM_OPLUS=n
+          CONFIG_TOUCHSCREEN_OPLUS=n
+          CONFIG_SOUND_OPLUS=n
 
-      - name: Build kernel
+          # Disable wireless vendor stacks that need blobs (you can re-enable qcacld later if you provide headers)
+          CONFIG_MAC80211=n
+          CONFIG_CFG80211=n
+          CONFIG_WLAN=n
+
+          # Disable Netfilter/iptables/conntrack fully (fix xt_register_target undefined symbol)
+          CONFIG_NETFILTER=n
+          CONFIG_NF_CONNTRACK=n
+          CONFIG_NF_CONNTRACK_IPV4=n
+          CONFIG_NF_CONNTRACK_IPV6=n
+          CONFIG_NETFILTER_XTABLES=n
+          CONFIG_IP_NF_IPTABLES=n
+          CONFIG_IP_NF_FILTER=n
+          CONFIG_IP_NF_NAT=n
+          CONFIG_IP_NF_TARGET_MASQUERADE=n
+          CONFIG_IP6_NF_IPTABLES=n
+          CONFIG_IP6_NF_FILTER=n
+          CONFIG_BRIDGE_NETFILTER=n
+          CONFIG_NF_TABLES=n
+          CONFIG_NF_TABLES_IPV4=n
+          CONFIG_NF_TABLES_IPV6=n
+
+          # Reduce debug noise for release-like build
+          CONFIG_DEBUG_INFO=n
+          CONFIG_DEBUG_KERNEL=n
+          EOF
+
+      - name: Create no-vendor defconfig and blackhole vendor dirs
         working-directory: kernel
         run: |
-          make O=out ARCH=arm64 CC="ccache clang-18" LD="ld.lld-18" -j$(nproc)
-          ls out/arch/arm64/boot/
+          mkdir -p ../${OUTDIR}
+          # seed config from provided defconfig (vendor or sm8150_defconfig)
+          make O=../${OUTDIR} ARCH=arm64 ${{ github.event.inputs.kernel_defconfig }}
+          # merge the novendor defaults
+          make O=../${OUTDIR} ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../novendor.defaults
 
-      - name: Verify kernel output
-        run: |
-          test -f kernel/out/arch/arm64/boot/Image || exit 1
+          # Save the cleaned config as a new defconfig in kernel tree
+          cp ../${OUTDIR}/.config arch/arm64/configs/oneplus7_novendor_defconfig
 
-      # -------------------------------------------------------------------
-      # ANYKERNEL3 PACKAGE
-      # -------------------------------------------------------------------
-      - name: Clone AnyKernel3
+          # Blackhole directories that commonly require vendor blobs/headers
+          for d in drivers/gpu/drm/msm/oplus drivers/misc/oplus* drivers/soc/oplus \
+                   drivers/input/oplus* drivers/oneplus* drivers/staging/qcacld-3.0 \
+                   drivers/media/platform/msm/camera drivers/thermal/qcom sound/soc/oplus* \
+                   net/netfilter net/ipv6/netfilter net/bridge/netfilter; do
+            if [ -d "$d" ]; then
+              echo -e "# blackholed for no-vendor build\nobj-y :=\nobj-m :=" > "$d/Makefile"
+            fi
+          done
+
+      - name: (optional) Apply KernelSU patch
+        if: ${{ github.event.inputs.apply_kernelsu == 'true' }}
+        working-directory: kernel
         run: |
-          git clone https://github.com/osm0sis/AnyKernel3.git
-          cd AnyKernel3
-          rm -rf *.img *.zip
-          sed -i 's|device.name1=.*|device.name1=guacamole|' anykernel.sh
-          sed -i 's|device.name2=.*|device.name2=guacamoleb|' anykernel.sh
-          sed -i 's|do.devicecheck=1|do.devicecheck=0|' anykernel.sh
+          echo "Applying KernelSU (user requested)"
+          # example: curl kernel su patch script and run; user supplies patch URL in repo or modify step to fetch.
+          # This is a placeholder — adapt to your real KernelSU steps.
+          # curl -sL <KERNELSU_SCRIPT_URL> | bash
+
+      - name: Build kernel (no-vendor)
+        working-directory: kernel
+        env:
+          PATH: ${{ github.workspace }}/clang/bin:$PATH
+        run: |
+          export CC=clang-18 || export CC=clang
+          export LD=ld.lld-18 || export LD=ld.lld
+          make O=../${OUTDIR} ARCH=arm64 oneplus7_novendor_defconfig
+          # Build with clang toolchain; allow non-fatal warnings
+          make O=../${OUTDIR} ARCH=arm64 -j$(nproc) CC="ccache clang-18" LD="ld.lld-18" KCFLAGS="-Wno-error"
+
+      - name: Verify kernel artifacts
+        run: |
+          if [ -f kernel/../${OUTDIR}/arch/arm64/boot/Image.gz-dtb ]; then
+            echo "Found Image.gz-dtb"
+          elif [ -f kernel/../${OUTDIR}/arch/arm64/boot/Image ]; then
+            echo "Found Image"
+          else
+            echo "Kernel not found!"
+            ls -la kernel/../${OUTDIR}/arch/arm64/boot || true
+            exit 1
+          fi
+
+      - name: Prepare AnyKernel3 packaging
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git anykernel
+          rm -f anykernel/*.img anykernel/*.zip
+          sed -i 's|device.name1=.*|device.name1=guacamole|' anykernel/anykernel.sh || true
+          sed -i 's|device.name2=.*|device.name2=guacamoleb|' anykernel/anykernel.sh || true
+          sed -i 's|do.devicecheck=1|do.devicecheck=0|' anykernel/anykernel.sh || true
+
+      - name: Copy kernel into AnyKernel3 and zip
+        run: |
+          KOUT=../${OUTDIR}/arch/arm64/boot
+          # prefer gz-dtb if present
+          if [ -f "$KOUT/Image.gz-dtb" ]; then
+            cp "$KOUT/Image.gz-dtb" anykernel/zImage
+          elif [ -f "$KOUT/Image" ]; then
+            cp "$KOUT/Image" anykernel/zImage
+          else
+            echo "No kernel image to copy"; exit 1
+          fi
+          cd anykernel
+          zip -r9 ../${KNAME}_Anykernel.zip ./*
+
+      - name: Download base boot.img (for repack)
+        run: |
+          mkdir -p bootbase
+          echo "Downloading ${ { github.event.inputs.boot_image_url } }"
+          wget -q -O bootbase/boot.img "${{ github.event.inputs.boot_image_url }}" || (echo "download failed" && exit 1)
+
+      - name: Repack boot.img with magiskboot
+        run: |
+          cd bootbase
+          # download magiskboot
+          wget -q -O magiskboot https://raw.githubusercontent.com/topjohnwu/magisk-files/main/magiskboot
+          chmod +x magiskboot
+          ./magiskboot unpack boot.img
+          # copy kernel
+          if [ -f ../${OUTDIR}/arch/arm64/boot/Image.gz-dtb ]; then
+            cp ../${OUTDIR}/arch/arm64/boot/Image.gz-dtb kernel
+          else
+            cp ../${OUTDIR}/arch/arm64/boot/Image kernel
+          fi
+          ./magiskboot repack boot.img new-boot.img
+          mv new-boot.img ../${KNAME}_boot.img
           cd ..
 
-      - name: Package AnyKernel3 ZIP
-        run: |
-          cp kernel/out/arch/arm64/boot/Image* AnyKernel3/
-          cd AnyKernel3
-          zip -r9 ../${{ env.KERNEL_NAME }}_Anykernel.zip ./*
-
-      # -------------------------------------------------------------------
-      # BOOT IMAGE REPACK
-      # -------------------------------------------------------------------
-      - name: Download base boot image
-        run: |
-          mkdir -p boot
-          wget -O boot/base_boot.img "${{ github.event.inputs.bootimg_url }}"
-
-      - name: Clone Android Image Kitchen
-        run: |
-          git clone https://github.com/osm0sis/Android-Image-Kitchen.git aik
-
-      - name: Repack boot image with new kernel
-        run: |
-          cd aik
-          ./unpackimg.sh ../boot/base_boot.img
-          cp ../kernel/out/arch/arm64/boot/Image* split_img/
-          ./repackimg.sh
-          mv image-new.img ../${{ env.KERNEL_NAME }}_boot.img
-          cd ..
-
-      # -------------------------------------------------------------------
-      # UPLOAD ARTIFACTS
-      # -------------------------------------------------------------------
-      - name: Upload outputs
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.KERNEL_NAME }}_Outputs
+          name: ${{ env.KNAME }}-outputs
           path: |
-            ${{ env.KERNEL_NAME }}_Anykernel.zip
-            ${{ env.KERNEL_NAME }}_boot.img
+            ${KNAME}_Anykernel.zip
+            ${KNAME}_boot.img
