@@ -32,10 +32,16 @@ jobs:
       PATH: /usr/lib/llvm-18/bin:$PATH
 
     steps:
+      # --- Install essential tools (fixes 'tar' not found) ---
+      - name: Install system utilities
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tar gzip xz-utils
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
