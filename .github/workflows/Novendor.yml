@@ -1,4 +1,4 @@
-name: Build kernel (KSN) & WIFI A16 - no vendor blobs
+name: Build kernel (KSN) & WIFI A16 - no vendor blobs, KernelSU enabled by default
 
 on:
   workflow_dispatch:
@@ -20,11 +20,12 @@ on:
         required: false
         default: OP7_KSN_wifi-LOS-noVendor.zip
       apply_kernelsu:
-        description: Apply KernelSU patch (true/false)
+        description: Apply KernelSU patch
         required: true
-        default: false
+        type: boolean
+        default: true
       kernelsu_patch_url:
-        description: KernelSU setup.sh URL (used if apply_kernelsu==true)
+        description: KernelSU setup.sh URL (used if apply_kernelsu == true)
         required: false
         default: https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh
 
@@ -111,17 +112,15 @@ jobs:
           CONFIG_DEBUG_KERNEL=n
           EOF
 
-      - name: Prepare kernel build output and defconfig
+      - name: Prepare kernel output and defconfig
         working-directory: kernel
-        env:
-          KERNEL_DEFCONFIG: ${{ github.event.inputs.kernel_defconfig }}
         run: |
           set -euo pipefail
           export PATH="/usr/lib/llvm-18/bin:$PATH"
           mkdir -p out
-          make O=out ARCH=arm64 "${KERNEL_DEFCONFIG}"
+          make O=out ARCH=arm64 "${{ github.event.inputs.kernel_defconfig }}"
 
-      - name: Apply novendor config and blackhole vendor dirs
+      - name: Apply novendor defaults and blackhole directories
         working-directory: kernel
         run: |
           set -euo pipefail
@@ -133,7 +132,7 @@ jobs:
           blackhole() {
             d="$1"
             if [ -d "$d" ]; then
-              echo -e '# blackholed for no-vendor build\nobj-y :=\nobj-m :=' > "$d/Makefile"
+              printf "# blackholed for no-vendor build\nobj-y :=\nobj-m :=" > "$d/Makefile"
               chmod 644 "$d/Makefile"
               echo "Blackholed: $d"
             fi
@@ -157,7 +156,7 @@ jobs:
           sed -i '/^# Kconfig: vendor/d' arch/arm64/configs/* || true
 
           find net/netfilter net/ipv6/netfilter net/bridge/netfilter -type f -name Makefile -print0 | \
-            xargs -0 -I{} sh -c 'echo -e "# disabled (no vendor blobs/netfilter)\nobj-y :=\nobj-m :=" > "$1"' _ {}
+            xargs -0 -I{} sh -c 'printf "# disabled (no vendor blobs/netfilter)\nobj-y :=\nobj-m :=" > "$1"' _ {}
 
       - name: Build kernel
         working-directory: kernel
