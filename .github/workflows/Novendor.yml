@@ -34,7 +34,7 @@ jobs:
     env:
       OUTDIR: out
       CLANG_DIR: clang
-      # make invocation string (used in build step)
+      # used in make invocation below
       KERNEL_CMDLINE: "ARCH=arm64 LLVM=1 LLVM_IAS=1 O=out CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu-"
 
     steps:
@@ -53,7 +53,6 @@ jobs:
 
       - name: Set inputs into environment
         run: |
-          # store inputs so later steps can use them safely
           echo "KERNEL_SOURCE_URL=${{ github.event.inputs.kernel_source_url }}" >> $GITHUB_ENV
           echo "KERNEL_BRANCH=${{ github.event.inputs.kernel_branch }}" >> $GITHUB_ENV
           echo "KERNEL_DEFCONFIG=${{ github.event.inputs.kernel_defconfig }}" >> $GITHUB_ENV
@@ -143,14 +142,15 @@ EOF
           fi
           echo "Using defconfig: $KCONF"
           make O=../${OUTDIR} ARCH=arm64 "${KCONF}"
+          cd ..
 
       - name: Merge novendor.defaults and save cleaned defconfig
         run: |
           set -euo pipefail
           cd kernel
           make O=../${OUTDIR} ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../novendor.defaults
-          # Save final config for reproducibility if possible
           cp ../${OUTDIR}/.config arch/arm64/configs/oneplus_novendor_defconfig || true
+          cd ..
 
       - name: Blackhole vendor-heavy directories
         run: |
@@ -175,15 +175,20 @@ EOF
               echo "Blackholed: $d"
             fi
           done
+          cd ..
 
       - name: (optional) Apply KernelSU patch
-        if: ${{ github.event.inputs.apply_kernelsu == 'true' && github.event.inputs.kernelsu_patch_url != '' }}
+        if: ${{ github.event.inputs.apply_kernelsu == 'true' }}
         run: |
           set -euo pipefail
-          cd kernel
-          echo "Applying KernelSU from ${{ github.event.inputs.kernelsu_patch_url }}"
-          curl -LSs "${{ github.event.inputs.kernelsu_patch_url }}" | bash -
-          cd ..
+          if [ -n "${{ github.event.inputs.kernelsu_patch_url }}" ]; then
+            cd kernel
+            echo "Applying KernelSU from ${{ github.event.inputs.kernelsu_patch_url }}"
+            curl -LSs "${{ github.event.inputs.kernelsu_patch_url }}" | bash -
+            cd ..
+          else
+            echo "KernelSU flag set but no URL provided; skipping."
+          fi
 
       - name: Build kernel (no-vendor)
         run: |
@@ -192,6 +197,69 @@ EOF
           export PATH="${PWD}/../${CLANG_DIR}/bin:$PATH"
           export CC="clang-18"
           export LD="ld.lld-18"
-          # Try to use saved cleaned defconfig if it exists
           if [ -f arch/arm64/configs/oneplus_novendor_defconfig ]; then
-            make O=../${OUTDIR} ARCH=arm64 oneplus_novendo_
+            make O=../${OUTDIR} ARCH=arm64 oneplus_novendor_defconfig || true
+          fi
+          make ${KERNEL_CMDLINE} -j$(nproc) CC="ccache clang-18" LD="ld.lld-18" V=1
+          if [ -f ../${OUTDIR}/arch/arm64/boot/Image.gz-dtb ]; then
+            echo "Built Image.gz-dtb"
+          elif [ -f ../${OUTDIR}/arch/arm64/boot/Image ]; then
+            echo "Built Image"
+          else
+            echo "Kernel image not found after build"
+            ls -la ../${OUTDIR}/arch/arm64/boot || true
+            exit 1
+          fi
+          cd ..
+
+      - name: Prepare AnyKernel3 and package zip
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/khalidaboelmagd/AnyKernel3 AnyKernel3 || true
+          rm -rf AnyKernel3/.git || true
+          if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
+            cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/zImage
+          else
+            cp out/arch/arm64/boot/Image AnyKernel3/zImage
+          fi
+          cd AnyKernel3
+          sed -i 's|device.name1=.*|device.name1=guacamole|' anykernel.sh || true
+          sed -i 's|device.name2=.*|device.name2=guacamoleb|' anykernel.sh || true
+          sed -i 's|do.devicecheck=1|do.devicecheck=0|' anykernel.sh || true
+          zip -r9 ../${{ env.OUTPUT_ZIP_NAME }}.zip ./*
+
+      - name: Build Wi-Fi module (qcacld-3.0) if present
+        run: |
+          set -euo pipefail
+          cd kernel
+          export PATH="${PWD}/../${CLANG_DIR}/bin:$PATH"
+          make O=../${OUTDIR} ARCH=arm64 modules_prepare CC="ccache clang-18"
+          if [ -d drivers/staging/qcacld-3.0 ]; then
+            make ${KERNEL_CMDLINE} -j$(nproc) M=drivers/staging/qcacld-3.0 CC="ccache clang-18" LD="ld.lld-18"
+            mkdir -p ../modules/vendor/lib/modules
+            find ../${OUTDIR}/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \; || true
+            sudo chown -R "$(id -u)":"$(id -g)" ../modules || true
+          else
+            echo "qcacld-3.0 not found; skipping Wi-Fi module build"
+          fi
+          cd ..
+
+      - name: Package Wi-Fi modules (if any)
+        run: |
+          set -euo pipefail
+          if [ -d modules ]; then
+            cd modules
+            zip -r ../${{ env.OUTPUT_ZIP_NAME }}-modules.zip . || true
+            cd ..
+          else
+            echo "No modules directory; skipping modules zip"
+          fi
+
+      - name: Upload zips
+        uses: actions/upload-artifact@v4
+        with:
+          name: outputs
+          path: |
+            ${{ env.OUTPUT_ZIP_NAME }}.zip
+            ${{ env.OUTPUT_ZIP_NAME }}-modules.zip
+          if-no-files-found: error
