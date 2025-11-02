@@ -1,4 +1,4 @@
-name: Build kernel (KSN) minimal no vendor blobs, KernelSU enabled by default
+name: Build kernel (KSN) & WIFI A16 - no vendor blobs, KernelSU enabled by default
 
 on:
   workflow_dispatch:
@@ -25,7 +25,7 @@ on:
         type: boolean
         default: true
       kernelsu_patch_url:
-        description: KernelSU setup.sh URL (used if apply_kernelsu==true)
+        description: KernelSU setup.sh URL (used if apply_kernelsu == true)
         required: false
         default: https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh
 
@@ -74,8 +74,6 @@ jobs:
           set -euo pipefail
           cat > ../novendor.defaults <<'EOF'
           CONFIG_LOCALVERSION_AUTO=y
-
-          # Disable major vendor-dependent modules known to cause build failures without blobs
           CONFIG_VENDOR_EDIT=n
           CONFIG_OPLUS_DEVICE_INFO=n
           CONFIG_OPLUS_PROJECT_INFO=n
@@ -99,7 +97,6 @@ jobs:
           CONFIG_NF_CONNTRACK=n
           CONFIG_NF_CONNTRACK_IPV4=n
           CONFIG_NF_CONNTRACK_IPV6=n
-
           CONFIG_IP_NF_IPTABLES=n
           CONFIG_IP_NF_FILTER=n
           CONFIG_IP_NF_NAT=n
@@ -123,7 +120,7 @@ jobs:
           mkdir -p out
           make O=out ARCH=arm64 "${{ github.event.inputs.kernel_defconfig }}"
 
-      - name: Blackhole vendor-dependent directories (minimal)
+      - name: Apply novendor defaults and fully blackhole netfilter
         working-directory: kernel
         run: |
           set -euo pipefail
@@ -146,12 +143,17 @@ jobs:
           blackhole drivers/soc/oplus
           blackhole drivers/media/platform/msm/camera
           blackhole drivers/staging/qcacld-3.0
-          blackhole net/netfilter
+
+          # Fully recursive blackhole netfilter Makefiles to prevent undefined symbol linker errors
+          for d in net/netfilter net/ipv6/netfilter net/bridge/netfilter; do
+            find "$d" -type f -name Makefile -exec sh -c 'printf "# disabled (no vendor blobs/netfilter)\nobj-y :=\nobj-m :=" > "$1"' sh {} \;
+            echo "Fully blackholed netfilter directory: $d"
+          done
 
           sed -i '/^source.*vendor/d' arch/arm64/configs/* || true
           sed -i '/^# Kconfig: vendor/d' arch/arm64/configs/* || true
 
-      - name: Build kernel (verbose single-thread)
+      - name: Build kernel (verbose, single-thread)
         working-directory: kernel
         env:
           KBUILD_OUTPUT: out
