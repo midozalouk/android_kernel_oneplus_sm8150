@@ -1,4 +1,4 @@
-name: Build kernel (KSN) & WIFI A16 -- no vendor, no blobs
+name: Build Kernel - No Vendor Blobs
 
 on:
   workflow_dispatch:
@@ -6,260 +6,141 @@ on:
       kernel_source_url:
         description: "URL of the kernel source repository"
         required: true
-        default: "https://github.com/LineageOS/android_kernel_oneplus_sm8150"
+        default: "https://github.com/crdroidandroid/android_kernel_oneplus_sm8150"
       kernel_branch:
         description: "Branch of the kernel source"
         required: true
-        default: "lineage-23.0"
+        default: "14.0"
       kernel_defconfig:
         description: "defconfig file to use"
         required: true
         default: "vendor/sm8150_defconfig"
       output_name:
-        description: "Name of the output.zip"
+        description: "Name of the output zip"
         required: false
-        default: "OP7_KSN_wifi-LOS-noVendor.zip"
+        default: "OP7_Kernel-NoVendor.zip"
       apply_kernelsu:
         description: "Apply KernelSU patch (true/false)"
+        type: boolean
         required: true
-        default: "false"
+        default: false
       kernelsu_patch_url:
-        description: "KernelSU patch/setup script URL (leave empty to skip)"
+        description: "KernelSU setup.sh URL"
         required: false
-        default: ""
+        default: "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     env:
-      OUTDIR: out
-      CLANG_DIR: clang
-      # used in make invocation below
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_MAXSIZE: "2G"
       KERNEL_CMDLINE: "ARCH=arm64 LLVM=1 LLVM_IAS=1 O=out CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu-"
+      OUTPUT_ZIP_NAME: ${{ github.event.inputs.output_name }}
 
     steps:
-      - name: Install base system dependencies (tar early)
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y git wget curl tar gzip xz-utils unzip zip \
-            build-essential bc bison flex libssl-dev libncurses-dev libelf-dev \
-            clang-18 lld-18 llvm-18 gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            ccache python3 git-lfs
-
-      - name: Checkout workflow repository (full git)
+      - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Set inputs into environment
-        run: |
-          echo "KERNEL_SOURCE_URL=${{ github.event.inputs.kernel_source_url }}" >> $GITHUB_ENV
-          echo "KERNEL_BRANCH=${{ github.event.inputs.kernel_branch }}" >> $GITHUB_ENV
-          echo "KERNEL_DEFCONFIG=${{ github.event.inputs.kernel_defconfig }}" >> $GITHUB_ENV
-          echo "OUTPUT_ZIP_NAME=${{ github.event.inputs.output_name }}" >> $GITHUB_ENV
-          echo "APPLY_KERNELSU=${{ github.event.inputs.apply_kernelsu }}" >> $GITHUB_ENV
-          echo "KERNELSU_PATCH_URL=${{ github.event.inputs.kernelsu_patch_url }}" >> $GITHUB_ENV
-
-      - name: Ensure Clang 18 available (download fallback)
-        run: |
-          if ! command -v clang-18 >/dev/null 2>&1; then
-            mkdir -p "${CLANG_DIR}"
-            CLANG_TGZ="clang+llvm-18.1.8-x86_64-linux-gnu-ubuntu-22.04.tar.xz"
-            wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/${CLANG_TGZ}"
-            tar -xf "${CLANG_TGZ}" -C "${CLANG_DIR}" --strip-components=1
-          fi
-          echo "${PWD}/${CLANG_DIR}/bin" >> $GITHUB_PATH
-
-      - name: Clone kernel source
+      - name: Checkout Kernel Source
         run: |
           set -euo pipefail
-          : "${KERNEL_SOURCE_URL:=https://github.com/LineageOS/android_kernel_oneplus_sm8150}"
-          : "${KERNEL_BRANCH:=lineage-23.0}"
-          echo "Cloning kernel from $KERNEL_SOURCE_URL (branch $KERNEL_BRANCH)"
-          git clone --depth=1 --branch "$KERNEL_BRANCH" "$KERNEL_SOURCE_URL" kernel
+          git clone --depth=1 --branch "${{ github.event.inputs.kernel_branch }}" "${{ github.event.inputs.kernel_source_url }}" kernel
           cd kernel
-          git submodule update --init --recursive || true
-          cd ..
+          git submodule update --init --recursive
 
-      - name: Create novendor.defaults (safe heredoc)
+      - name: Install dependencies
         run: |
           set -euo pipefail
-          cat > novendor.defaults <<'EOF'
-            # Force localversion predictable
-            CONFIG_LOCALVERSION_AUTO=y
-            
-            # Vendor / proprietary modules
-            CONFIG_VENDOR_EDIT=n
-            CONFIG_OPLUS_DEVICE_INFO=n
-            CONFIG_OPLUS_PROJECT_INFO=n
-            CONFIG_OPLUS_ARCH_EXTENDS=n
-            CONFIG_OPLUS_FEATURE_CHG_BASIC=n
-            CONFIG_OPLUS_FEATURE_SENSOR=n
-            CONFIG_MSM_CAMERA=n
-            CONFIG_QCOM_CAMERA=n
-            CONFIG_SPECTRA_CAMERA=n
-            CONFIG_SPECTRA_EEPROM=n
-            CONFIG_DRM_MSM_OPLUS=n
-            CONFIG_TOUCHSCREEN_OPLUS=n
-            CONFIG_SOUND_OPLUS=n
-            
-            # Wireless stacks that usually need blobs
-            CONFIG_MAC80211=n
-            CONFIG_CFG80211=n
-            CONFIG_WLAN=n
-            
-            # Netfilter / iptables / conntrack disables
-            CONFIG_NETFILTER=n
-            CONFIG_NETFILTER_XTABLES=n
-            CONFIG_NF_CONNTRACK=n
-            CONFIG_NF_CONNTRACK_IPV4=n
-            CONFIG_NF_CONNTRACK_IPV6=n
-            CONFIG_IP_NF_IPTABLES=n
-            CONFIG_IP_NF_FILTER=n
-            CONFIG_IP_NF_NAT=n
-            CONFIG_IP_NF_TARGET_MASQUERADE=n
-            CONFIG_IP6_NF_IPTABLES=n
-            CONFIG_IP6_NF_FILTER=n
-            CONFIG_BRIDGE_NETFILTER=n
-            CONFIG_NF_TABLES=n
-            CONFIG_NF_TABLES_IPV4=n
-            CONFIG_NF_TABLES_IPV6=n
-            
-            # Reduce debug for smaller kernel (optional)
-            CONFIG_DEBUG_INFO=n
-            CONFIG_DEBUG_KERNEL=n
-            EOF
+          sudo apt-get update -y
+          sudo apt-get install -y clang-18 llvm-18 lld-18 gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu make python3 libssl-dev build-essential bc bison flex unzip git git-lfs libelf-dev pahole zip
+          git clone https://github.com/khalidaboelmagd/AnyKernel3
+          rm -rf AnyKernel3/.git
+          mkdir -p modules/vendor/lib/modules
 
-      - name: Prepare kernel out and seed defconfig
+      - name: Optional: KernelSU Setup
+        if: ${{ github.event.inputs.apply_kernelsu }}
+        working-directory: kernel
         run: |
           set -euo pipefail
-          cd kernel
-          mkdir -p ../${OUTDIR}
-          if [ -z "${KERNEL_DEFCONFIG:-}" ]; then
-            KCONF="vendor/sm8150_defconfig"
-          else
-            KCONF="${KERNEL_DEFCONFIG}"
-          fi
-          echo "Using defconfig: $KCONF"
-          make O=../${OUTDIR} ARCH=arm64 "${KCONF}"
-          cd ..
+          export PATH="/usr/lib/llvm-18/bin:$PATH"
+          curl -LSs "${{ github.event.inputs.kernelsu_patch_url }}" | bash -
 
-      - name: Merge novendor.defaults and save cleaned defconfig
+      - name: Prepare "No Vendor" Config
+        working-directory: kernel
         run: |
           set -euo pipefail
-          cd kernel
-          make O=../${OUTDIR} ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../novendor.defaults
-          cp ../${OUTDIR}/.config arch/arm64/configs/oneplus_novendor_defconfig || true
-          cd ..
+          cat > ../novendor.defaults <<'EOF'
+          CONFIG_LOCALVERSION_AUTO=y
+          CONFIG_VENDOR_EDIT=n
+          CONFIG_OPLUS_DEVICE_INFO=n
+          CONFIG_OPLUS_PROJECT_INFO=n
+          CONFIG_OPLUS_ARCH_EXTENDS=n
+          CONFIG_OPLUS_FEATURE_CHG_BASIC=n
+          CONFIG_OPLUS_FEATURE_SENSOR=n
+          CONFIG_MSM_CAMERA=n
+          CONFIG_QCOM_CAMERA=n
+          CONFIG_SPECTRA_CAMERA=n
+          CONFIG_SPECTRA_EEPROM=n
+          CONFIG_DRM_MSM_OPLUS=n
+          CONFIG_TOUCHSCREEN_OPLUS=n
+          CONFIG_SOUND_OPLUS=n
+          CONFIG_MAC80211=n
+          CONFIG_CFG80211=n
+          CONFIG_WLAN=n
+          CONFIG_NETFILTER=n
+          CONFIG_NETFILTER_XTABLES=n
+          CONFIG_NF_CONNTRACK=n
+          CONFIG_DEBUG_INFO=n
+          CONFIG_DEBUG_KERNEL=n
+          EOF
 
-      - name: Blackhole vendor-heavy directories
+      - name: Apply Config and Blackhole Directories
+        working-directory: kernel
         run: |
           set -euo pipefail
-          cd kernel
-          for d in \
-            drivers/gpu/drm/msm/oplus \
-            drivers/misc/oplus* \
-            drivers/soc/oplus \
-            drivers/input/oplus* \
-            drivers/oneplus* \
-            drivers/staging/qcacld-3.0 \
-            drivers/media/platform/msm/camera \
-            drivers/thermal/qcom \
-            sound/soc/oplus* \
-            net/netfilter \
-            net/ipv6/netfilter \
-            net/bridge/netfilter; do
-            if [ -d "$d" ]; then
-              echo -e "# blackholed for no-vendor build\nobj-y :=\nobj-m :=" > "$d/Makefile"
-              chmod 644 "$d/Makefile"
-              echo "Blackholed: $d"
+          export PATH="/usr/lib/llvm-18/bin:$PATH"
+          mkdir -p out
+          make O=out ARCH=arm64 ${{ github.event.inputs.kernel_defconfig }}
+          make O=out ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../novendor.defaults
+
+          blackhole() {
+            if [ -d "$1" ]; then
+              echo -e '# Blackholed for no-vendor build\nobj-y := \nobj-m :=' > "$1/Makefile"
+              echo "Blackholed: $1"
             fi
-          done
-          cd ..
+          }
 
-      - name: (optional) Apply KernelSU patch
-        if: ${{ github.event.inputs.apply_kernelsu == 'true' }}
+          blackhole drivers/gpu/drm/msm/oplus
+          blackhole drivers/misc/oplus
+          blackhole drivers/soc/oplus
+          blackhole drivers/input/oplus
+          blackhole drivers/oneplus
+          blackhole drivers/staging/qcacld-3.0
+          blackhole net/netfilter
+          blackhole net/ipv6/netfilter
+          blackhole net/bridge/netfilter
+
+      - name: Build kernel
+        working-directory: kernel
         run: |
           set -euo pipefail
-          if [ -n "${{ github.event.inputs.kernelsu_patch_url }}" ]; then
-            cd kernel
-            echo "Applying KernelSU from ${{ github.event.inputs.kernelsu_patch_url }}"
-            curl -LSs "${{ github.event.inputs.kernelsu_patch_url }}" | bash -
-            cd ..
-          else
-            echo "KernelSU flag set but no URL provided; skipping."
-          fi
+          export PATH="/usr/lib/llvm-18/bin:$PATH"
+          export KBUILD_OUTPUT=out
+          make ${KERNEL_CMDLINE} CC="ccache clang-18" LD="ld.lld-18" -j$(nproc)
+          cp out/arch/arm64/boot/Image ../AnyKernel3/
 
-      - name: Build kernel (no-vendor)
+      - name: Package Kernel
         run: |
           set -euo pipefail
-          cd kernel
-          export PATH="${PWD}/../${CLANG_DIR}/bin:$PATH"
-          export CC="clang-18"
-          export LD="ld.lld-18"
-          if [ -f arch/arm64/configs/oneplus_novendor_defconfig ]; then
-            make O=../${OUTDIR} ARCH=arm64 oneplus_novendor_defconfig || true
-          fi
-          make ${KERNEL_CMDLINE} -j$(nproc) CC="ccache clang-18" LD="ld.lld-18" V=1
-          if [ -f ../${OUTDIR}/arch/arm64/boot/Image.gz-dtb ]; then
-            echo "Built Image.gz-dtb"
-          elif [ -f ../${OUTDIR}/arch/arm64/boot/Image ]; then
-            echo "Built Image"
-          else
-            echo "Kernel image not found after build"
-            ls -la ../${OUTDIR}/arch/arm64/boot || true
-            exit 1
-          fi
-          cd ..
-
-      - name: Prepare AnyKernel3 and package zip
-        run: |
-          set -euo pipefail
-          git clone --depth=1 https://github.com/khalidaboelmagd/AnyKernel3 AnyKernel3 || true
-          rm -rf AnyKernel3/.git || true
-          if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
-            cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/zImage
-          else
-            cp out/arch/arm64/boot/Image AnyKernel3/zImage
-          fi
           cd AnyKernel3
-          sed -i 's|device.name1=.*|device.name1=guacamole|' anykernel.sh || true
-          sed -i 's|device.name2=.*|device.name2=guacamoleb|' anykernel.sh || true
-          sed -i 's|do.devicecheck=1|do.devicecheck=0|' anykernel.sh || true
-          zip -r9 ../${{ env.OUTPUT_ZIP_NAME }}.zip ./*
-
-      - name: Build Wi-Fi module (qcacld-3.0) if present
-        run: |
-          set -euo pipefail
-          cd kernel
-          export PATH="${PWD}/../${CLANG_DIR}/bin:$PATH"
-          make O=../${OUTDIR} ARCH=arm64 modules_prepare CC="ccache clang-18"
-          if [ -d drivers/staging/qcacld-3.0 ]; then
-            make ${KERNEL_CMDLINE} -j$(nproc) M=drivers/staging/qcacld-3.0 CC="ccache clang-18" LD="ld.lld-18"
-            mkdir -p ../modules/vendor/lib/modules
-            find ../${OUTDIR}/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \; || true
-            sudo chown -R "$(id -u)":"$(id -g)" ../modules || true
-          else
-            echo "qcacld-3.0 not found; skipping Wi-Fi module build"
-          fi
+          zip -r "../${OUTPUT_ZIP_NAME}" *
           cd ..
 
-      - name: Package Wi-Fi modules (if any)
-        run: |
-          set -euo pipefail
-          if [ -d modules ]; then
-            cd modules
-            zip -r ../${{ env.OUTPUT_ZIP_NAME }}-modules.zip . || true
-            cd ..
-          else
-            echo "No modules directory; skipping modules zip"
-          fi
-
-      - name: Upload zips
+      - name: Upload Kernel Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: outputs
-          path: |
-            ${{ env.OUTPUT_ZIP_NAME }}.zip
-            ${{ env.OUTPUT_ZIP_NAME }}-modules.zip
+          name: kernel-zip
+          path: ${{ env.OUTPUT_ZIP_NAME }}
           if-no-files-found: error
