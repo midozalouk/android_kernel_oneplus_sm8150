@@ -1,4 +1,4 @@
-name: Build kernel (KSN) & WIFI A16 - no vendor blobs, KernelSU enabled by default
+name: Build kernel (KSN) minimal no vendor blobs, KernelSU enabled by default
 
 on:
   workflow_dispatch:
@@ -25,7 +25,7 @@ on:
         type: boolean
         default: true
       kernelsu_patch_url:
-        description: KernelSU setup.sh URL (used if apply_kernelsu == true)
+        description: KernelSU setup.sh URL (used if apply_kernelsu==true)
         required: false
         default: https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh
 
@@ -74,6 +74,8 @@ jobs:
           set -euo pipefail
           cat > ../novendor.defaults <<'EOF'
           CONFIG_LOCALVERSION_AUTO=y
+
+          # Disable major vendor-dependent modules known to cause build failures without blobs
           CONFIG_VENDOR_EDIT=n
           CONFIG_OPLUS_DEVICE_INFO=n
           CONFIG_OPLUS_PROJECT_INFO=n
@@ -97,6 +99,7 @@ jobs:
           CONFIG_NF_CONNTRACK=n
           CONFIG_NF_CONNTRACK_IPV4=n
           CONFIG_NF_CONNTRACK_IPV6=n
+
           CONFIG_IP_NF_IPTABLES=n
           CONFIG_IP_NF_FILTER=n
           CONFIG_IP_NF_NAT=n
@@ -120,7 +123,7 @@ jobs:
           mkdir -p out
           make O=out ARCH=arm64 "${{ github.event.inputs.kernel_defconfig }}"
 
-      - name: Apply novendor defaults and blackhole directories
+      - name: Blackhole vendor-dependent directories (minimal)
         working-directory: kernel
         run: |
           set -euo pipefail
@@ -140,25 +143,15 @@ jobs:
 
           blackhole drivers/gpu/drm/msm/oplus
           blackhole drivers/misc/oplus
-          for d in drivers/misc/oplus*; do [ -d "$d" ] && blackhole "$d" || true; done
           blackhole drivers/soc/oplus
-          for d in drivers/input/oplus*; do [ -d "$d" ] && blackhole "$d" || true; done
-          for d in drivers/oneplus*; do [ -d "$d" ] && blackhole "$d" || true; done
-          blackhole drivers/staging/qcacld-3.0
           blackhole drivers/media/platform/msm/camera
-          blackhole drivers/thermal/qcom
-          for d in sound/soc/oplus*; do [ -d "$d" ] && blackhole "$d" || true; done
+          blackhole drivers/staging/qcacld-3.0
           blackhole net/netfilter
-          blackhole net/ipv6/netfilter
-          blackhole net/bridge/netfilter
 
           sed -i '/^source.*vendor/d' arch/arm64/configs/* || true
           sed -i '/^# Kconfig: vendor/d' arch/arm64/configs/* || true
 
-          find net/netfilter net/ipv6/netfilter net/bridge/netfilter -type f -name Makefile -print0 | \
-            xargs -0 -I{} sh -c 'printf "# disabled (no vendor blobs/netfilter)\nobj-y :=\nobj-m :=" > "$1"' _ {}
-
-      - name: Build kernel
+      - name: Build kernel (verbose single-thread)
         working-directory: kernel
         env:
           KBUILD_OUTPUT: out
@@ -170,11 +163,11 @@ jobs:
           export HOSTCC="clang-18"
           export HOSTCXX="clang++-18"
 
-          make ${KERNEL_CMDLINE} V=1 CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" -j$(nproc)
+          make ${KERNEL_CMDLINE} V=2 -j1 CC="ccache clang-18" LD="ld.lld-18"
           test -f out/arch/arm64/boot/Image
           cp out/arch/arm64/boot/Image ../AnyKernel3
 
-      - name: Build Wi-Fi Module (qca_cld3)
+      - name: Build Wi-Fi Module (qcacld-3.0)
         working-directory: kernel
         run: |
           set -euo pipefail
@@ -184,13 +177,11 @@ jobs:
           export HOSTCXX="clang++-18"
 
           make ${KERNEL_CMDLINE} modules_prepare CC="ccache clang-18"
-          make ${KERNEL_CMDLINE} V=1 CC="ccache clang-18" LD="ld.lld-18" AR="llvm-ar-18" NM="llvm-nm-18" \
-            OBJCOPY="llvm-objcopy-18" OBJDUMP="llvm-objdump-18" STRIP="llvm-strip-18" \
-            -j$(nproc) M=drivers/staging/qcacld-3.0 modules
+          make ${KERNEL_CMDLINE} V=2 -j1 CC="ccache clang-18" LD="ld.lld-18" M=drivers/staging/qcacld-3.0 modules
 
           sudo mkdir -p ../modules/vendor/lib/modules
           sudo find out/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \;
-          sudo chown -R "$(id -u)":"$(id -g)" ../modules
+          sudo chown -R $(id -u):$(id -g) ../modules
 
       - name: Package Kernel and Wi-Fi Modules
         run: |
@@ -205,7 +196,7 @@ jobs:
           fi
           cd ..
 
-      - name: Upload build outputs
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: outputs
