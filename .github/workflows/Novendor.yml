@@ -1,98 +1,78 @@
-name: Build kernel (KSN) & WIFI A16 -- no vendor, no blobs
+name: Build kernel (KSN) & WIFI A16 - no vendor blobs
 
 on:
   workflow_dispatch:
     inputs:
       kernel_source_url:
-        description: "URL of the kernel source repository"
+        description: URL of the kernel source repository
         required: true
-        default: "https://github.com/LineageOS/android_kernel_oneplus_sm8150"
+        default: https://github.com/LineageOS/android_kernel_oneplus_sm8150
       kernel_branch:
-        description: "Branch of the kernel source"
+        description: Branch of the kernel source
         required: true
-        default: "lineage-23.0"
+        default: lineage-23.0
       kernel_defconfig:
-        description: "defconfig file to use"
+        description: defconfig file to use
         required: true
-        default: "vendor/sm8150_defconfig"
+        default: vendor/sm8150_defconfig
       output_name:
-        description: "Name of the output.zip"
+        description: Name of the output zip
         required: false
-        default: "OP7_KSN_wifi-LOS-noVendor.zip"
+        default: OP7_KSN_wifi-LOS-noVendor.zip
       apply_kernelsu:
-        description: "Apply KernelSU patch (true/false)"
+        description: Apply KernelSU patch (true/false)
         required: true
-        default: "false"
+        default: false
       kernelsu_patch_url:
-        description: "KernelSU setup.sh URL (ignored if apply_kernelsu=false)"
+        description: KernelSU setup.sh URL (used if apply_kernelsu==true)
         required: false
-        default: "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
+        default: https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh
 
 jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
-      CCACHE_NOHASHDIR: "true"
-      CCACHE_MAXSIZE: "2G"
-      KERNEL_CMDLINE: "ARCH=arm64 LLVM=1 LLVM_IAS=1 O=out CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu-"
+      CCACHE_COMPILERCHECK: '%compiler% -dumpmachine; %compiler% -dumpversion'
+      CCACHE_NOHASHDIR: 'true'
+      CCACHE_MAXSIZE: '2G'
+      KERNEL_CMDLINE: 'ARCH=arm64 LLVM=1 LLVM_IAS=1 O=out CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu-'
       OUTPUT_ZIP_NAME: ${{ github.event.inputs.output_name }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Checkout Kernel Source
-        env:
-          KERNEL_SOURCE_URL: ${{ github.event.inputs.kernel_source_url || 'https://github.com/LineageOS/android_kernel_oneplus_sm8150' }}
-          KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch || 'lineage-23.0' }}
+      - name: Clone Kernel Source
         run: |
           set -euo pipefail
-          git clone --depth=1 --branch "${KERNEL_BRANCH}" "${KERNEL_SOURCE_URL}" kernel
+          git clone --depth=1 --branch "${{ github.event.inputs.kernel_branch }}" "${{ github.event.inputs.kernel_source_url }}" kernel
           cd kernel
           git submodule update --init --recursive
 
-      - name: Set up ccache
-        uses: hendrikmuhs/ccache-action@v1.2
-
-      - name: Cleanup space
-        run: |
-          set -euo pipefail
-          sudo rm -rf /opt/ghc /usr/local/share/boost /usr/share/dotnet "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" || true
-
-      - name: Install dependencies
+      - name: Install dependencies & Setup environment
         run: |
           set -euo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y \
-            ccache clang-18 llvm-18 lld-18 gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu binutils make python3 libssl-dev \
-            build-essential bc bison flex unzip git git-lfs libelf-dev pahole \
-            zip
+          sudo apt-get install -y ccache clang-18 llvm-18 lld-18 gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu binutils make python3 libssl-dev build-essential bc bison flex unzip git git-lfs libelf-dev pahole zip
           git clone https://github.com/khalidaboelmagd/AnyKernel3
           rm -rf AnyKernel3/.git
           mkdir -p modules/vendor/lib/modules
 
-      - name: Optional KernelSU-Next setup
+      - name: Optional KernelSU Setup
         if: ${{ github.event.inputs.apply_kernelsu == 'true' }}
         working-directory: kernel
-        env:
-          KSU_URL: ${{ github.event.inputs.kernelsu_patch_url }}
         run: |
           set -euo pipefail
           export PATH="/usr/lib/llvm-18/bin:$PATH"
-          curl -LSs "${KSU_URL}" | bash -
+          curl -LSs "${{ github.event.inputs.kernelsu_patch_url }}" | bash -
 
-      - name: Write novendor.defaults
+      - name: Write novendor.defaults config
         working-directory: kernel
         run: |
           set -euo pipefail
           cat > ../novendor.defaults <<'EOF'
           CONFIG_LOCALVERSION_AUTO=y
-
-          # Vendor / proprietary modules
           CONFIG_VENDOR_EDIT=n
           CONFIG_OPLUS_DEVICE_INFO=n
           CONFIG_OPLUS_PROJECT_INFO=n
@@ -107,12 +87,10 @@ jobs:
           CONFIG_TOUCHSCREEN_OPLUS=n
           CONFIG_SOUND_OPLUS=n
 
-          # Wireless stacks (likely require blobs)
           CONFIG_MAC80211=n
           CONFIG_CFG80211=n
           CONFIG_WLAN=n
 
-          # Netfilter / xt / nf_conntrack (disable entirely)
           CONFIG_NETFILTER=n
           CONFIG_NETFILTER_XTABLES=n
           CONFIG_NF_CONNTRACK=n
@@ -129,37 +107,34 @@ jobs:
           CONFIG_NF_TABLES_IPV4=n
           CONFIG_NF_TABLES_IPV6=n
 
-          # Optional: reduce debug
           CONFIG_DEBUG_INFO=n
           CONFIG_DEBUG_KERNEL=n
           EOF
 
-      - name: Prepare defconfig
+      - name: Prepare kernel build output and defconfig
         working-directory: kernel
         env:
-          KERNEL_DEFCONFIG: ${{ github.event.inputs.kernel_defconfig || 'vendor/sm8150_defconfig' }}
+          KERNEL_DEFCONFIG: ${{ github.event.inputs.kernel_defconfig }}
         run: |
           set -euo pipefail
           export PATH="/usr/lib/llvm-18/bin:$PATH"
           mkdir -p out
           make O=out ARCH=arm64 "${KERNEL_DEFCONFIG}"
 
-      - name: Apply novendor defaults and blackhole dirs
+      - name: Apply novendor config and blackhole vendor dirs
         working-directory: kernel
         run: |
           set -euo pipefail
           export PATH="/usr/lib/llvm-18/bin:$PATH"
 
           make O=out ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../novendor.defaults
-
           cp out/.config arch/arm64/configs/oneplus_novendor_defconfig || true
 
-          # Blackhole problematic dirs (Makefiles to empty obj lists)
           blackhole() {
             d="$1"
             if [ -d "$d" ]; then
-              printf '%s\n' '# blackholed for no-vendor build' 'obj-y :=' 'obj-m :=' > "$d/Makefile"
-              chmod 0644 "$d/Makefile"
+              echo -e '# blackholed for no-vendor build\nobj-y :=\nobj-m :=' > "$d/Makefile"
+              chmod 644 "$d/Makefile"
               echo "Blackholed: $d"
             fi
           }
@@ -178,13 +153,11 @@ jobs:
           blackhole net/ipv6/netfilter
           blackhole net/bridge/netfilter
 
-          # Remove vendor fragments from Kconfig includes (best effort)
           sed -i '/^source.*vendor/d' arch/arm64/configs/* || true
           sed -i '/^# Kconfig: vendor/d' arch/arm64/configs/* || true
 
-          # Extra guard: wipe any leftover Makefiles in netfilter families
           find net/netfilter net/ipv6/netfilter net/bridge/netfilter -type f -name Makefile -print0 | \
-            xargs -0 -I{} bash -c "printf '%s\n' '# disabled (no vendor blobs/netfilter)' 'obj-y :=' 'obj-m :=' > '{}'" || true
+            xargs -0 -I{} sh -c 'echo -e "# disabled (no vendor blobs/netfilter)\nobj-y :=\nobj-m :=" > "$1"' _ {}
 
       - name: Build kernel
         working-directory: kernel
@@ -233,7 +206,7 @@ jobs:
           fi
           cd ..
 
-      - name: Upload outputs
+      - name: Upload build outputs
         uses: actions/upload-artifact@v4
         with:
           name: outputs
