@@ -59,7 +59,7 @@ jobs:
           rm -rf AnyKernel3/.git
           mkdir -p modules/vendor/lib/modules
 
-      - name: Optional: KernelSU Setup
+      - name: Optional:KernelSU Setup
         if: ${{ github.event.inputs.apply_kernelsu }}
         working-directory: kernel
         run: |
