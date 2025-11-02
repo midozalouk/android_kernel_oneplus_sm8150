@@ -1,4 +1,4 @@
-name: Build OnePlus 7 Kernel (No Vendor Blobs)
+name: Build kernel (KSN) & WIFI A16 -- no vendor, no blobs
 
 on:
   workflow_dispatch:
@@ -31,30 +31,29 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-
     env:
-      # keep the toolchain path set later
       OUTDIR: out
       CLANG_DIR: clang
+      # make invocation string (used in build step)
+      KERNEL_CMDLINE: "ARCH=arm64 LLVM=1 LLVM_IAS=1 O=out CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu-"
 
     steps:
-      - name: Checkout this workflow repository
+      - name: Install base system dependencies (tar early)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y git wget curl tar gzip xz-utils unzip zip \
+            build-essential bc bison flex libssl-dev libncurses-dev libelf-dev \
+            clang-18 lld-18 llvm-18 gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            ccache python3 git-lfs
+
+      - name: Checkout workflow repository (full git)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Install system dependencies (tar early so checkout won't fail)
+      - name: Set inputs into environment
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y \
-            git wget curl tar gzip xz-utils unzip zip \
-            build-essential bc bison flex libssl-dev libncurses-dev \
-            clang-18 lld-18 llvm-18 gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            ccache
-
-      - name: Set inputs into environment (no YAML expressions later)
-        run: |
-          # Write inputs directly to GITHUB_ENV; we'll apply shell defaults later
+          # store inputs so later steps can use them safely
           echo "KERNEL_SOURCE_URL=${{ github.event.inputs.kernel_source_url }}" >> $GITHUB_ENV
           echo "KERNEL_BRANCH=${{ github.event.inputs.kernel_branch }}" >> $GITHUB_ENV
           echo "KERNEL_DEFCONFIG=${{ github.event.inputs.kernel_defconfig }}" >> $GITHUB_ENV
@@ -62,31 +61,31 @@ jobs:
           echo "APPLY_KERNELSU=${{ github.event.inputs.apply_kernelsu }}" >> $GITHUB_ENV
           echo "KERNELSU_PATCH_URL=${{ github.event.inputs.kernelsu_patch_url }}" >> $GITHUB_ENV
 
-      - name: Download Clang toolchain (if system clang-18 missing)
+      - name: Ensure Clang 18 available (download fallback)
         run: |
           if ! command -v clang-18 >/dev/null 2>&1; then
-            mkdir -p ${CLANG_DIR}
+            mkdir -p "${CLANG_DIR}"
             CLANG_TGZ="clang+llvm-18.1.8-x86_64-linux-gnu-ubuntu-22.04.tar.xz"
             wget -q "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/${CLANG_TGZ}"
-            tar -xf ${CLANG_TGZ} -C ${CLANG_DIR} --strip-components=1
+            tar -xf "${CLANG_TGZ}" -C "${CLANG_DIR}" --strip-components=1
           fi
           echo "${PWD}/${CLANG_DIR}/bin" >> $GITHUB_PATH
 
       - name: Clone kernel source
         run: |
-          # apply shell-level defaults (if user left inputs empty)
+          set -euo pipefail
           : "${KERNEL_SOURCE_URL:=https://github.com/LineageOS/android_kernel_oneplus_sm8150}"
           : "${KERNEL_BRANCH:=lineage-23.0}"
           echo "Cloning kernel from $KERNEL_SOURCE_URL (branch $KERNEL_BRANCH)"
           git clone --depth=1 --branch "$KERNEL_BRANCH" "$KERNEL_SOURCE_URL" kernel
           cd kernel
           git submodule update --init --recursive || true
+          cd ..
 
       - name: Create novendor.defaults (safe heredoc)
-        working-directory: kernel
         run: |
           set -euo pipefail
-          cat > ../novendor.defaults <<'EOF'
+          cat > novendor.defaults <<'EOF'
 # Force localversion predictable
 CONFIG_LOCALVERSION_AUTO=y
 
@@ -132,32 +131,31 @@ CONFIG_DEBUG_INFO=n
 CONFIG_DEBUG_KERNEL=n
 EOF
 
-      - name: Prepare kernel output directory and seed defconfig
-        working-directory: kernel
+      - name: Prepare kernel out and seed defconfig
         run: |
           set -euo pipefail
-          export PATH="${PWD}/../${CLANG_DIR}/bin:$PATH"
+          cd kernel
           mkdir -p ../${OUTDIR}
-          # Use provided defconfig, or fallback to vendor/sm8150_defconfig if empty
-          if [ -z "${KERNEL_DEFCONFIG}" ]; then
+          if [ -z "${KERNEL_DEFCONFIG:-}" ]; then
             KCONF="vendor/sm8150_defconfig"
           else
             KCONF="${KERNEL_DEFCONFIG}"
           fi
           echo "Using defconfig: $KCONF"
-          make O=../${OUTDIR} ARCH=arm64 "$KCONF"
+          make O=../${OUTDIR} ARCH=arm64 "${KCONF}"
 
       - name: Merge novendor.defaults and save cleaned defconfig
-        working-directory: kernel
         run: |
           set -euo pipefail
+          cd kernel
           make O=../${OUTDIR} ARCH=arm64 olddefconfig KCONFIG_ALLCONFIG=../novendor.defaults
+          # Save final config for reproducibility if possible
           cp ../${OUTDIR}/.config arch/arm64/configs/oneplus_novendor_defconfig || true
 
       - name: Blackhole vendor-heavy directories
-        working-directory: kernel
         run: |
           set -euo pipefail
+          cd kernel
           for d in \
             drivers/gpu/drm/msm/oplus \
             drivers/misc/oplus* \
@@ -179,72 +177,21 @@ EOF
           done
 
       - name: (optional) Apply KernelSU patch
-        if: env.APPLY_KERNELSU == 'true'
-        working-directory: kernel
+        if: ${{ github.event.inputs.apply_kernelsu == 'true' && github.event.inputs.kernelsu_patch_url != '' }}
         run: |
           set -euo pipefail
-          if [ -n "${KERNELSU_PATCH_URL}" ]; then
-            echo "Applying KernelSU from ${KERNELSU_PATCH_URL}"
-            curl -LSs "${KERNELSU_PATCH_URL}" | bash -
-          else
-            echo "APPLY_KERNELSU was true but no KERNELSU_PATCH_URL provided - skipping"
-          fi
+          cd kernel
+          echo "Applying KernelSU from ${{ github.event.inputs.kernelsu_patch_url }}"
+          curl -LSs "${{ github.event.inputs.kernelsu_patch_url }}" | bash -
+          cd ..
 
       - name: Build kernel (no-vendor)
-        working-directory: kernel
-        env:
-          KBUILD_OUTPUT: ../${OUTDIR}
         run: |
           set -euo pipefail
+          cd kernel
           export PATH="${PWD}/../${CLANG_DIR}/bin:$PATH"
           export CC="clang-18"
           export LD="ld.lld-18"
-          make O=../${OUTDIR} ARCH=arm64 oneplus_novendor_defconfig || true
-          # fallback: if that custom defconfig isn't present, just use the earlier .config
-          make O=../${OUTDIR} ARCH=arm64 -j$(nproc) CC="ccache clang-18" LD="ld.lld-18"
-
-      - name: Verify and copy kernel image to AnyKernel3
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-          if [ -f ../${OUTDIR}/arch/arm64/boot/Image.gz-dtb ]; then
-            echo "Found Image.gz-dtb"
-            cp ../${OUTDIR}/arch/arm64/boot/Image.gz-dtb ../AnyKernel3/zImage
-          elif [ -f ../${OUTDIR}/arch/arm64/boot/Image ]; then
-            echo "Found Image"
-            cp ../${OUTDIR}/arch/arm64/boot/Image ../AnyKernel3/zImage
-          else
-            echo "Kernel image not found in ../${OUTDIR}/arch/arm64/boot"
-            ls -la ../${OUTDIR}/arch/arm64/boot || true
-            exit 1
-          fi
-
-      - name: Prepare AnyKernel3 and package zip
-        run: |
-          git clone --depth=1 https://github.com/khalidaboelmagd/AnyKernel3 || true
-          rm -rf AnyKernel3/.git || true
-          cd AnyKernel3 || exit 1
-          sed -i 's|device.name1=.*|device.name1=guacamole|' anykernel.sh || true
-          sed -i 's|device.name2=.*|device.name2=guacamoleb|' anykernel.sh || true
-          sed -i 's|do.devicecheck=1|do.devicecheck=0|' anykernel.sh || true
-          zip -r9 ../${OUTPUT_ZIP_NAME}.zip ./*
-
-      - name: Package modules (if built)
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-          mkdir -p ../modules/vendor/lib/modules || true
-          if [ -d ../${OUTDIR}/drivers/staging/qcacld-3.0 ]; then
-            find ../${OUTDIR}/drivers/staging/qcacld-3.0 -name "*.ko" -exec cp -v {} ../modules/vendor/lib/modules/ \; || true
-          fi
-          cd ../modules || exit 0
-          zip -r ../${OUTPUT_ZIP_NAME}-modules.zip . || true
-
-      - name: Upload zips
-        uses: actions/upload-artifact@v4
-        with:
-          name: outputs
-          path: |
-            ${OUTPUT_ZIP_NAME}.zip
-            ${OUTPUT_ZIP_NAME}-modules.zip
-          if-no-files-found: error
+          # Try to use saved cleaned defconfig if it exists
+          if [ -f arch/arm64/configs/oneplus_novendor_defconfig ]; then
+            make O=../${OUTDIR} ARCH=arm64 oneplus_novendo_
