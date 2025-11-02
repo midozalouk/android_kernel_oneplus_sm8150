@@ -228,7 +228,5 @@ obj-m :=" > "$1"' _ {} ;
         uses: actions/upload-artifact@v4
         with:
           name: outputs
-          path: |
-            ${{ env.OUTPUT_ZIP_NAME }}.zip
-            ${{ env.OUTPUT_ZIP_NAME }}-modules.zip
+          path: ${{ env.OUTPUT_ZIP_NAME }}.zip,${{ env.OUTPUT_ZIP_NAME }}-modules.zip
           if-no-files-found: error
