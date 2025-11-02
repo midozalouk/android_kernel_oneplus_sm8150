@@ -59,14 +59,6 @@ jobs:
           rm -rf AnyKernel3/.git
           mkdir -p modules/vendor/lib/modules
 
-      - name: Optional:KernelSU Setup
-        if: ${{ github.event.inputs.apply_kernelsu }}
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-          export PATH="/usr/lib/llvm-18/bin:$PATH"
-          curl -LSs "${{ github.event.inputs.kernelsu_patch_url }}" | bash -
-
       - name: Prepare "No Vendor" Config
         working-directory: kernel
         run: |
