@@ -85,50 +85,50 @@ jobs:
         run: |
           set -euo pipefail
           cat > novendor.defaults <<'EOF'
-# Force localversion predictable
-CONFIG_LOCALVERSION_AUTO=y
-
-# Vendor / proprietary modules
-CONFIG_VENDOR_EDIT=n
-CONFIG_OPLUS_DEVICE_INFO=n
-CONFIG_OPLUS_PROJECT_INFO=n
-CONFIG_OPLUS_ARCH_EXTENDS=n
-CONFIG_OPLUS_FEATURE_CHG_BASIC=n
-CONFIG_OPLUS_FEATURE_SENSOR=n
-CONFIG_MSM_CAMERA=n
-CONFIG_QCOM_CAMERA=n
-CONFIG_SPECTRA_CAMERA=n
-CONFIG_SPECTRA_EEPROM=n
-CONFIG_DRM_MSM_OPLUS=n
-CONFIG_TOUCHSCREEN_OPLUS=n
-CONFIG_SOUND_OPLUS=n
-
-# Wireless stacks that usually need blobs
-CONFIG_MAC80211=n
-CONFIG_CFG80211=n
-CONFIG_WLAN=n
-
-# Netfilter / iptables / conntrack disables
-CONFIG_NETFILTER=n
-CONFIG_NETFILTER_XTABLES=n
-CONFIG_NF_CONNTRACK=n
-CONFIG_NF_CONNTRACK_IPV4=n
-CONFIG_NF_CONNTRACK_IPV6=n
-CONFIG_IP_NF_IPTABLES=n
-CONFIG_IP_NF_FILTER=n
-CONFIG_IP_NF_NAT=n
-CONFIG_IP_NF_TARGET_MASQUERADE=n
-CONFIG_IP6_NF_IPTABLES=n
-CONFIG_IP6_NF_FILTER=n
-CONFIG_BRIDGE_NETFILTER=n
-CONFIG_NF_TABLES=n
-CONFIG_NF_TABLES_IPV4=n
-CONFIG_NF_TABLES_IPV6=n
-
-# Reduce debug for smaller kernel (optional)
-CONFIG_DEBUG_INFO=n
-CONFIG_DEBUG_KERNEL=n
-EOF
+            # Force localversion predictable
+            CONFIG_LOCALVERSION_AUTO=y
+            
+            # Vendor / proprietary modules
+            CONFIG_VENDOR_EDIT=n
+            CONFIG_OPLUS_DEVICE_INFO=n
+            CONFIG_OPLUS_PROJECT_INFO=n
+            CONFIG_OPLUS_ARCH_EXTENDS=n
+            CONFIG_OPLUS_FEATURE_CHG_BASIC=n
+            CONFIG_OPLUS_FEATURE_SENSOR=n
+            CONFIG_MSM_CAMERA=n
+            CONFIG_QCOM_CAMERA=n
+            CONFIG_SPECTRA_CAMERA=n
+            CONFIG_SPECTRA_EEPROM=n
+            CONFIG_DRM_MSM_OPLUS=n
+            CONFIG_TOUCHSCREEN_OPLUS=n
+            CONFIG_SOUND_OPLUS=n
+            
+            # Wireless stacks that usually need blobs
+            CONFIG_MAC80211=n
+            CONFIG_CFG80211=n
+            CONFIG_WLAN=n
+            
+            # Netfilter / iptables / conntrack disables
+            CONFIG_NETFILTER=n
+            CONFIG_NETFILTER_XTABLES=n
+            CONFIG_NF_CONNTRACK=n
+            CONFIG_NF_CONNTRACK_IPV4=n
+            CONFIG_NF_CONNTRACK_IPV6=n
+            CONFIG_IP_NF_IPTABLES=n
+            CONFIG_IP_NF_FILTER=n
+            CONFIG_IP_NF_NAT=n
+            CONFIG_IP_NF_TARGET_MASQUERADE=n
+            CONFIG_IP6_NF_IPTABLES=n
+            CONFIG_IP6_NF_FILTER=n
+            CONFIG_BRIDGE_NETFILTER=n
+            CONFIG_NF_TABLES=n
+            CONFIG_NF_TABLES_IPV4=n
+            CONFIG_NF_TABLES_IPV6=n
+            
+            # Reduce debug for smaller kernel (optional)
+            CONFIG_DEBUG_INFO=n
+            CONFIG_DEBUG_KERNEL=n
+            EOF
 
       - name: Prepare kernel out and seed defconfig
         run: |
